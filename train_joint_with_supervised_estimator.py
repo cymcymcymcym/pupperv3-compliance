@@ -32,6 +32,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Tuple, List
 
+# Set EGL for headless rendering BEFORE importing mujoco
+os.environ.setdefault("MUJOCO_GL", "egl")
+
 import flax.linen as nn
 import jax
 from jax import numpy as jp
@@ -524,7 +527,8 @@ def main():
     
     # Environment
     parser.add_argument("--num-envs", type=int, default=4096,
-                        help="Number of parallel environments")
+                        help="Number of parallel environments. Note: PPO has minimum batch requirements, "
+                             "so very small num_envs (like 2) won't actually reduce training time much.")
     parser.add_argument("--seed", type=int, default=42)
     
     # Logging
