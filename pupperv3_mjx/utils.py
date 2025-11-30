@@ -249,7 +249,10 @@ def visualize_policy(
     # initialize the state
     rng = jax.random.PRNGKey(0)
     state = jit_reset(rng)
-    state.info["command"] = command_seq[0]
+    # Use functional update to avoid tracer leak
+    new_info = {k: v for k, v in state.info.items()}
+    new_info["command"] = command_seq[0]
+    state = state.replace(info=new_info)
     rollout = [state.pipeline_state]
 
     # grab a trajectory
@@ -260,8 +263,10 @@ def visualize_policy(
     for i in range(n_steps):
         act_rng, rng = jax.random.split(rng)
 
-        # Change command every 80 steps
-        state.info["command"] = command_seq[int(i / 80)]
+        # Change command every 80 steps - use functional update
+        new_info = {k: v for k, v in state.info.items()}
+        new_info["command"] = command_seq[int(i / 80)]
+        state = state.replace(info=new_info)
 
         ctrl, _ = jit_inference_fn(state.obs, act_rng)
         state = jit_step(state, ctrl)
@@ -275,15 +280,23 @@ def visualize_policy(
         eval_env.render(rollout[::render_every], camera="tracking_cam"),
         fps=fps,
     )
-    wandb.log(
-        {
-            "eval/video/command/vx": vx,
-            "eval/video/command/vy": vy,
-            "eval/video/command/wz": wz,
-            "eval/video": wandb.Video(filename, format="mp4"),
-        },
-        step=current_step,
-    )
+    print(f"  Saved video to {filename}")
+    
+    # Log to wandb if available
+    try:
+        import wandb
+        if wandb.run is not None:
+            wandb.log(
+                {
+                    "eval/video/command/vx": vx,
+                    "eval/video/command/vy": vy,
+                    "eval/video/command/wz": wz,
+                    "eval/video": wandb.Video(filename, format="mp4"),
+                },
+                step=current_step,
+            )
+    except Exception:
+        pass  # wandb not available or not initialized
 
 
 def activation_fn_map(activation_name: str):

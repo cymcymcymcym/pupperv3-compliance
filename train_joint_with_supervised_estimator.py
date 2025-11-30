@@ -397,7 +397,7 @@ def get_training_config(args, actor_steps: int):
     config.maximum_roll_command = 0.0
     
     config.policy = config_dict.ConfigDict()
-    config.policy.hidden_layer_sizes = (128, 64, 64)
+    config.policy.hidden_layer_sizes = (256, 128, 128, 128)  # Must match pretrained checkpoint
     config.policy.activation = "elu"
     
     return config
@@ -596,9 +596,9 @@ def main():
         def create_env(**kwargs):
             return PupperV3EnvWithEstimator(
                 path=args.model_path,
-                reward_config=reward_config.rewards,
+                reward_config=reward_config,
                 action_scale=0.3,
-                observation_history=15,
+                observation_history=20,  # Must match pretrained checkpoint (morning-jazz-49 uses 20)
                 joint_lower_limits=sim_config.joint_lower_limits,
                 joint_upper_limits=sim_config.joint_upper_limits,
                 torso_name=sim_config.torso_name,
@@ -636,9 +636,9 @@ def main():
             randomization_fn=functools.partial(
                 domain_randomization.domain_randomize,
                 friction_range=(0.6, 1.4),
-                base_mass_range=(-1.0, 1.0),
-                kp_range=(0.85, 1.15),
-                kd_range=(0.85, 1.15),
+                body_mass_scale_range=(0.8, 1.2),
+                kp_multiplier_range=(0.85, 1.15),
+                kd_multiplier_range=(0.85, 1.15),
             ),
             seed=args.seed + round_idx,
         )
@@ -704,15 +704,8 @@ def main():
         model.save_params(str(actor_checkpoint_path), actor_params)
         print(f"  Saved actor checkpoint to {actor_checkpoint_path}")
         
-        # Export policy JSON
-        policy_json_path = round_folder / "policy.json"
-        utils.export_policy(
-            make_policy=make_inference_fn,
-            params=actor_params,
-            output_path=str(policy_json_path),
-            activation=training_config.policy.activation
-        )
-        print(f"  Exported policy to {policy_json_path}")
+        # Note: Policy JSON export skipped (use checkpoint for inference)
+        # The Brax checkpoint can be loaded directly for inference
         
         # Update for next round
         current_actor_checkpoint = str(actor_checkpoint_path)
