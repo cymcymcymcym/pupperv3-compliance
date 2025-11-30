@@ -715,8 +715,11 @@ def main():
         # ====================================================================
         print(f"\n--- Phase 2: Collect Data ({args.data_collection_steps:,} steps) ---")
         
+        # Create a FRESH environment for data collection (avoid tracer leak from PPO)
+        data_collection_env = create_env()
+        
         obs_data, force_data = collect_data_with_policy(
-            env=env,
+            env=data_collection_env,
             make_inference_fn=make_inference_fn,
             params=actor_params,
             num_steps=args.data_collection_steps,
