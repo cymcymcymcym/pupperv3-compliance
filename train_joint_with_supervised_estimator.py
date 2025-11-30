@@ -574,9 +574,9 @@ def main():
     
     admittance_gains = tuple(float(x) for x in args.admittance_gains.split(","))
     
-    # Setup output
+    # Setup output (use absolute path - required by Orbax)
     train_datetime = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_folder = Path(f"{args.output_dir}_{train_datetime}")
+    output_folder = Path(f"{args.output_dir}_{train_datetime}").resolve()
     output_folder.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70)
@@ -762,7 +762,8 @@ def main():
         
         # Save actor checkpoint using Orbax (same format as PPO uses internally)
         # actor_params is (normalizer_params, policy_params) tuple from train_fn
-        actor_checkpoint_path = round_folder / "actor_checkpoint"
+        # NOTE: Orbax requires ABSOLUTE paths
+        actor_checkpoint_path = (round_folder / "actor_checkpoint").resolve()
         orbax_checkpointer = ocp.PyTreeCheckpointer()
         # Save and wait for completion
         orbax_checkpointer.save(
