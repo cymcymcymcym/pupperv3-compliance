@@ -625,8 +625,11 @@ def main():
     fe_params, input_mean, input_std = load_estimator_from_json(args.force_estimator_path)
     print(f"  Input dim: {len(input_mean)}")
     
-    # Track actor checkpoint path (updated each round)
-    current_actor_checkpoint = args.actor_checkpoint_path
+    # Track actor checkpoint path
+    # Note: We only restore from the INITIAL checkpoint (morning-jazz-49) on round 0
+    # For subsequent rounds, we train from scratch with improved force estimator
+    # This is because our Orbax saves don't match PPO's expected checkpoint structure
+    initial_actor_checkpoint = args.actor_checkpoint_path
     
     # ========================================================================
     # Training Rounds
@@ -739,10 +742,11 @@ def main():
             except Exception as e:
                 print(f"  Video rendering failed: {e}")
         
-        # Checkpoint loading
+        # Checkpoint loading - only restore from initial checkpoint on round 0
+        # For subsequent rounds, train from scratch (but with improved force estimator)
         checkpoint_kwargs = {}
-        if current_actor_checkpoint:
-            checkpoint_path = Path(current_actor_checkpoint)
+        if round_idx == 0 and initial_actor_checkpoint:
+            checkpoint_path = Path(initial_actor_checkpoint)
             if not checkpoint_path.is_absolute():
                 checkpoint_path = Path.cwd() / checkpoint_path
             if checkpoint_path.exists():
@@ -750,6 +754,8 @@ def main():
                 checkpoint_kwargs["restore_checkpoint_path"] = checkpoint_path
             else:
                 print(f"  Warning: Checkpoint not found: {checkpoint_path}")
+        else:
+            print(f"  Training actor from scratch (round {round_idx + 1}, with updated force estimator)")
         
         # Train
         make_inference_fn, actor_params, _ = train_fn(
@@ -774,9 +780,7 @@ def main():
         
         # Note: Policy JSON export skipped (use checkpoint for inference)
         # The Brax checkpoint can be loaded directly for inference
-        
-        # Update checkpoint path for next round
-        current_actor_checkpoint = str(actor_checkpoint_path)
+        # We still save the checkpoint for potential manual use, but don't restore from it
         
         # ====================================================================
         # Phase 2: Collect Data
@@ -855,7 +859,7 @@ def main():
     
     print(f"\nFinal outputs:")
     print(f"  Force estimator: {final_fe_path}")
-    print(f"  Actor checkpoint: {current_actor_checkpoint}")
+    print(f"  Actor checkpoint: {output_folder}/round_{args.num_rounds - 1}/actor_checkpoint")
     print(f"  Output folder: {output_folder}")
     
     if use_wandb:
