@@ -78,13 +78,13 @@ def get_reward_config():
     return config
 
 
-def get_simulation_config():
+def get_simulation_config(model_path: str):
     """Get simulation configuration."""
     from etils import epath
     from brax.io import mjcf
     
     config = config_dict.ConfigDict()
-    config.model_path = "/home/matt/Documents/walk_pupper_self/pupper_v3_description/description/mujoco_xml/pupper_v3_complete.mjx.position.no_body.self_collision.two_iterations.xml"
+    config.model_path = model_path
     
     # Load model to get joint limits
     sys = mjcf.load(config.model_path)
@@ -270,6 +270,12 @@ def main():
         help="Path to force_estimator.json"
     )
     parser.add_argument(
+        "--model-path",
+        type=str,
+        default="../pupper_v3_description/description/mujoco_xml/pupper_v3_complete.mjx.position.no_body.self_collision.two_iterations.xml",
+        help="Path to MuJoCo XML model file (relative to pupperv3-compliance folder)"
+    )
+    parser.add_argument(
         "--actor-checkpoint-path",
         type=str,
         default=None,
@@ -329,7 +335,7 @@ def main():
     print("=" * 60)
     
     # Get configs
-    sim_config = get_simulation_config()
+    sim_config = get_simulation_config(args.model_path)
     train_config = get_training_config(args)
     policy_config = get_policy_config()
     reward_config = get_reward_config()
