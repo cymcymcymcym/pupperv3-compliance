@@ -17,6 +17,7 @@ import jax
 from jax import numpy as jp
 import numpy as np
 
+from brax import math
 from pupperv3_mjx.environment import PupperV3Env
 from brax.envs.base import State
 
@@ -130,17 +131,26 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         """
         return apply_force_estimator(obs, self._force_estimator)
     
-    def _force_to_velocity_command(self, force: jax.Array) -> jax.Array:
-        """Convert force to velocity command via admittance.
+    def _force_to_velocity_command(self, force_world: jax.Array, body_rotation: jax.Array) -> jax.Array:
+        """Convert world-frame force to body-frame velocity command via admittance.
+        
+        The force is applied in world frame, but velocity tracking reward uses body frame.
+        So we need to rotate the force into body frame before computing velocity command.
         
         Args:
-            force: Force vector [fx, fy, fz]
+            force_world: Force vector in WORLD frame [fx, fy, fz]
+            body_rotation: Body quaternion (world to body rotation)
             
         Returns:
-            Command vector [vx, vy, ang_vel] where ang_vel=0
+            Command vector [vx, vy, ang_vel] in BODY frame where ang_vel=0
         """
-        vel_x = self._admittance_gains[0] * force[0]
-        vel_y = self._admittance_gains[1] * force[1]
+        # Rotate world-frame force into body frame
+        # quat_inv gives the inverse rotation (world -> body)
+        force_body = math.rotate(force_world, math.quat_inv(body_rotation))
+        
+        # Apply admittance gains to body-frame force
+        vel_x = self._admittance_gains[0] * force_body[0]
+        vel_y = self._admittance_gains[1] * force_body[1]
         # No angular velocity from force (could add torque-based if needed)
         return jp.array([vel_x, vel_y, 0.0])
     
@@ -148,19 +158,22 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         """Step the environment with force estimator in the loop.
         
         1. Run force estimator on current observation
-        2. Convert to velocity command via admittance
+        2. Convert to velocity command via admittance (with frame rotation)
         3. Set as tracking target
         4. Run parent step (which computes tracking_lin_vel reward)
         """
-        # Get force (estimated or ground truth)
-        force = jp.where(
+        # Get force (estimated or ground truth) - this is in WORLD frame
+        force_world = jp.where(
             self._use_ground_truth_force,
             state.info['force_current_vector'],
             self._estimate_force(state.obs)
         )
         
-        # Convert force to velocity command
-        velocity_command = self._force_to_velocity_command(force)
+        # Get body rotation for frame conversion
+        body_rotation = state.pipeline_state.x.rot[self._torso_idx]
+        
+        # Convert world-frame force to body-frame velocity command
+        velocity_command = self._force_to_velocity_command(force_world, body_rotation)
         
         # Clip velocity command to reasonable range
         velocity_command = jp.clip(
@@ -173,7 +186,7 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         # Create new info dict with updated values
         new_info = {**state.info}
         new_info['command'] = velocity_command
-        new_info['estimated_force'] = force
+        new_info['estimated_force'] = force_world  # World frame force (matches force_current_vector)
         
         # Replace state with updated info
         state = state.replace(info=new_info)

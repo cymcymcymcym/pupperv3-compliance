@@ -376,7 +376,7 @@ def get_training_config(args, actor_steps: int):
     config.ppo = config_dict.ConfigDict()
     config.ppo.num_timesteps = actor_steps
     config.ppo.episode_length = 1000
-    config.ppo.num_evals = 5
+    config.ppo.num_evals = 2
     config.ppo.reward_scaling = 1
     config.ppo.normalize_observations = True
     config.ppo.action_repeat = 1
