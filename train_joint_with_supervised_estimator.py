@@ -475,7 +475,7 @@ def main():
     parser.add_argument("--actor-checkpoint-path", type=str, default=None,
                         help="Path to pretrained actor checkpoint (Brax format)")
     parser.add_argument("--model-path", type=str,
-                        default="pupper_v3_description/description/mujoco_xml/pupper_v3_complete.mjx.position.no_body.self_collision.two_iterations.xml",
+                        default="../pupper_v3_description/description/mujoco_xml/pupper_v3_complete.mjx.position.no_body.self_collision.two_iterations.xml",
                         help="Path to MuJoCo model XML")
     parser.add_argument("--output-dir", type=str, default="output_joint_supervised",
                         help="Output directory")
