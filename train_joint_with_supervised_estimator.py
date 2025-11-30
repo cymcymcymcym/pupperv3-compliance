@@ -796,8 +796,11 @@ def main():
         )
         
         print(f"  Collected {len(obs_data)} samples")
-        print(f"  Force magnitude: mean={np.linalg.norm(force_data, axis=1).mean():.3f}, "
-              f"max={np.linalg.norm(force_data, axis=1).max():.3f}")
+        if len(force_data) > 0 and force_data.ndim == 2:
+            print(f"  Force magnitude: mean={np.linalg.norm(force_data, axis=1).mean():.3f}, "
+                  f"max={np.linalg.norm(force_data, axis=1).max():.3f}")
+        else:
+            print(f"  Warning: No valid force data collected!")
         
         # Save collected data
         data_path = round_folder / "collected_data.npz"
@@ -829,9 +832,10 @@ def main():
         
         if use_wandb:
             try:
+                force_mean = np.linalg.norm(force_data, axis=1).mean() if (len(force_data) > 0 and force_data.ndim == 2) else 0
                 wandb.log({
                     f"round_{round_idx}/data_collected": len(obs_data),
-                    f"round_{round_idx}/force_mean": np.linalg.norm(force_data, axis=1).mean() if len(force_data) > 0 else 0,
+                    f"round_{round_idx}/force_mean": force_mean,
                 }, step=(round_idx + 1) * args.actor_steps_per_round)
             except:
                 pass
