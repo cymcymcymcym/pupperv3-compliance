@@ -407,7 +407,7 @@ def get_training_config(args, actor_steps: int):
 
 
 # ============================================================================
-# Collect Data with Trained Policy
+# Collect Data with Trained Policy (PARALLELIZED)
 # ============================================================================
 
 def collect_data_with_policy(
@@ -416,77 +416,105 @@ def collect_data_with_policy(
     params,
     num_steps: int = 100000,
     seed: int = 42,
+    num_parallel_envs: int = 256,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Collect (obs, force) data using trained policy."""
-    print(f"  Collecting {num_steps} steps of data...")
+    """Collect (obs, force) data using trained policy with parallel environments.
+    
+    Uses vmap to run multiple environments in parallel for much faster collection.
+    """
+    print(f"  Collecting {num_steps} steps of data with {num_parallel_envs} parallel envs...")
     
     inference_fn = make_inference_fn(params)
-    jit_inference = jax.jit(inference_fn)
-    jit_step = jax.jit(env.step)
-    jit_reset = jax.jit(env.reset)
+    
+    # Vectorize the environment functions
+    def batched_reset(rng):
+        rngs = jax.random.split(rng, num_parallel_envs)
+        return jax.vmap(env.reset)(rngs)
+    
+    def batched_step(state, action):
+        return jax.vmap(env.step)(state, action)
+    
+    def batched_inference(obs, rng):
+        rngs = jax.random.split(rng, num_parallel_envs)
+        return jax.vmap(lambda o, r: inference_fn(o, r))(obs, rngs)
+    
+    jit_reset = jax.jit(batched_reset)
+    jit_step = jax.jit(batched_step)
+    jit_inference = jax.jit(batched_inference)
     
     rng = jax.random.PRNGKey(seed)
     
     obs_list = []
     force_list = []
     
-    # Reset
+    # Reset all envs
     rng, reset_rng = jax.random.split(rng)
     state = jit_reset(reset_rng)
     
     steps_collected = 0
     total_steps = 0
-    last_print = 0
+    
+    print(f"    Starting parallel collection...")
     
     while steps_collected < num_steps:
-        total_steps += 1
+        total_steps += num_parallel_envs
         
-        # Get action
+        # Get actions for all envs
         rng, act_rng = jax.random.split(rng)
-        action, _ = jit_inference(state.obs, act_rng)
+        actions, _ = jit_inference(state.obs, act_rng)
         
-        # Step
-        state = jit_step(state, action)
+        # Step all envs
+        state = jit_step(state, actions)
         
-        # Collect
-        obs = np.array(state.obs)
-        force = np.array(state.info.get('force_current_vector', np.zeros(3)))
+        # Collect from all envs
+        obs_batch = np.array(state.obs)  # [num_envs, obs_dim]
+        force_batch = np.array(state.info.get('force_current_vector', np.zeros((num_parallel_envs, 3))))  # [num_envs, 3]
         
-        # Only collect if force is non-zero
-        force_mag = np.linalg.norm(force)
-        if force_mag > 0.1:
-            obs_list.append(obs)
-            force_list.append(force)
-            steps_collected += 1
+        # Filter non-zero forces
+        force_mags = np.linalg.norm(force_batch, axis=1)
+        valid_mask = force_mags > 0.1
         
-        # Reset if done (handle both scalar and array done)
-        done = state.done
-        if hasattr(done, 'any'):
-            should_reset = done.any()
-        else:
-            should_reset = bool(done)
+        if np.any(valid_mask):
+            obs_list.append(obs_batch[valid_mask])
+            force_list.append(force_batch[valid_mask])
+            steps_collected += np.sum(valid_mask)
         
-        if should_reset:
+        # Reset done envs
+        done = np.array(state.done)
+        if np.any(done):
+            # For simplicity, reset all envs if any are done
+            # (More sophisticated: only reset done ones)
             rng, reset_rng = jax.random.split(rng)
             state = jit_reset(reset_rng)
         
-        # Print progress
-        if steps_collected >= last_print + 10000 or (total_steps % 50000 == 0 and total_steps > 0):
-            print(f"    Collected {steps_collected}/{num_steps} samples (total steps: {total_steps}, force_mag: {force_mag:.3f})")
-            last_print = (steps_collected // 10000) * 10000
+        # Print progress every ~50k steps
+        if total_steps % (50000 // num_parallel_envs * num_parallel_envs) < num_parallel_envs:
+            avg_force = np.mean(force_mags)
+            valid_pct = np.mean(valid_mask) * 100
+            print(f"    Collected {steps_collected}/{num_steps} samples "
+                  f"(total steps: {total_steps}, avg_force: {avg_force:.3f}, valid: {valid_pct:.1f}%)")
         
-        # Safety: if we've done way more steps than expected, something is wrong
+        # Safety check
         if total_steps > num_steps * 20 and steps_collected < 100:
             print(f"    WARNING: Ran {total_steps} steps but only collected {steps_collected} samples")
-            print(f"    Last force magnitude: {force_mag:.6f}")
-            print(f"    Force vector: {force}")
+            print(f"    Force magnitudes: min={force_mags.min():.6f}, max={force_mags.max():.6f}")
             break
     
     if len(obs_list) == 0:
         print("    ERROR: No samples collected! Forces may all be zero.")
         return np.array([]), np.array([])
     
-    return np.array(obs_list), np.array(force_list)
+    # Concatenate all collected data
+    all_obs = np.concatenate(obs_list, axis=0)
+    all_forces = np.concatenate(force_list, axis=0)
+    
+    # Trim to exact number requested
+    if len(all_obs) > num_steps:
+        all_obs = all_obs[:num_steps]
+        all_forces = all_forces[:num_steps]
+    
+    print(f"    Collection complete: {len(all_obs)} samples")
+    return all_obs, all_forces
 
 
 # ============================================================================
@@ -516,6 +544,8 @@ def main():
                         help="Supervised epochs for force estimator per round")
     parser.add_argument("--data-collection-steps", type=int, default=200_000,
                         help="Steps to collect for estimator training per round")
+    parser.add_argument("--data-collection-envs", type=int, default=256,
+                        help="Number of parallel envs for data collection (higher = faster)")
     parser.add_argument("--estimator-lr", type=float, default=1e-4,
                         help="Learning rate for force estimator")
     parser.add_argument("--estimator-batch-size", type=int, default=2048,
@@ -754,6 +784,7 @@ def main():
             params=actor_params,
             num_steps=args.data_collection_steps,
             seed=args.seed + round_idx + 1000,
+            num_parallel_envs=args.data_collection_envs,
         )
         
         print(f"  Collected {len(obs_data)} samples")
