@@ -765,14 +765,11 @@ def main():
         # NOTE: Orbax requires ABSOLUTE paths
         actor_checkpoint_path = (round_folder / "actor_checkpoint").resolve()
         orbax_checkpointer = ocp.PyTreeCheckpointer()
-        # Save and wait for completion
         orbax_checkpointer.save(
             str(actor_checkpoint_path), 
             actor_params,
             force=True  # Overwrite if exists
         )
-        # Wait for async save to complete
-        orbax_checkpointer.wait_until_finished()
         print(f"  Saved actor checkpoint to {actor_checkpoint_path}")
         
         # Note: Policy JSON export skipped (use checkpoint for inference)
