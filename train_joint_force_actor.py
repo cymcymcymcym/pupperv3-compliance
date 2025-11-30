@@ -38,6 +38,14 @@ from brax.io import model
 from pupperv3_mjx import domain_randomization, utils
 from pupperv3_mjx.environment_with_estimator import PupperV3EnvWithEstimator
 
+# Try to import wandb, but make it optional
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("wandb not installed, training without logging")
+
 
 def get_reward_config():
     """Get reward configuration for compliance training.
@@ -316,6 +324,17 @@ def main():
         default=42,
         help="Random seed"
     )
+    parser.add_argument(
+        "--wandb-key",
+        type=str,
+        default=None,
+        help="Weights & Biases API key (optional)"
+    )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable wandb logging"
+    )
     
     args = parser.parse_args()
     
@@ -333,6 +352,30 @@ def main():
     print(f"Num envs: {args.num_envs}")
     print(f"Use ground truth force: {args.use_ground_truth_force}")
     print("=" * 60)
+    
+    # Initialize wandb if available and not disabled
+    use_wandb = WANDB_AVAILABLE and not args.no_wandb
+    if use_wandb:
+        if args.wandb_key:
+            wandb.login(key=args.wandb_key)
+        try:
+            wandb.init(
+                project="pupperv3-compliance",
+                config={
+                    "force_estimator_path": args.force_estimator_path,
+                    "actor_checkpoint_path": args.actor_checkpoint_path,
+                    "admittance_gains": admittance_gains,
+                    "num_timesteps": args.num_timesteps,
+                    "num_envs": args.num_envs,
+                },
+                settings={"_service_wait": 90, "init_timeout": 90}
+            )
+            print("Wandb initialized successfully")
+        except Exception as e:
+            print(f"Wandb init failed: {e}")
+            use_wandb = False
+    else:
+        print("Training without wandb logging")
     
     # Get configs
     sim_config = get_simulation_config(args.model_path)
@@ -389,6 +432,27 @@ def main():
     ydataerr = []
     times = [datetime.now()]
     
+    # Custom progress function that doesn't require wandb
+    def progress_fn(num_steps, metrics):
+        times.append(datetime.now())
+        x_data.append(num_steps)
+        y_data.append(metrics.get('eval/episode_reward', 0))
+        ydataerr.append(metrics.get('eval/episode_reward_std', 0))
+        
+        reward = metrics.get('eval/episode_reward', 0)
+        reward_std = metrics.get('eval/episode_reward_std', 0)
+        
+        elapsed = times[-1] - times[0]
+        steps_per_sec = num_steps / elapsed.total_seconds() if elapsed.total_seconds() > 0 else 0
+        
+        print(f"Step {num_steps:,} | Reward: {reward:.2f} ± {reward_std:.2f} | Steps/sec: {steps_per_sec:,.0f}")
+        
+        if use_wandb:
+            try:
+                wandb.log(metrics, step=num_steps)
+            except Exception as e:
+                pass  # Silently ignore wandb errors
+    
     # JIT step and reset for visualization
     jit_reset = jax.jit(env.reset)
     jit_step = jax.jit(env.step)
@@ -414,7 +478,12 @@ def main():
     # Setup checkpoint restoration
     checkpoint_kwargs = {}
     if args.actor_checkpoint_path:
-        checkpoint_path = Path(args.actor_checkpoint_path).resolve()
+        # Ensure absolute path
+        checkpoint_path = Path(args.actor_checkpoint_path)
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = Path.cwd() / checkpoint_path
+        checkpoint_path = checkpoint_path.resolve()
+        
         if checkpoint_path.exists():
             print(f"\nRestoring actor from checkpoint: {checkpoint_path}")
             checkpoint_kwargs["restore_checkpoint_path"] = checkpoint_path
@@ -426,16 +495,7 @@ def main():
     print("\nStarting training...")
     make_inference_fn, params, _ = train_fn(
         environment=env,
-        progress_fn=functools.partial(
-            utils.progress,
-            times=times,
-            x_data=x_data,
-            y_data=y_data,
-            ydataerr=ydataerr,
-            num_timesteps=train_config.ppo.num_timesteps,
-            min_y=0,
-            max_y=40,
-        ),
+        progress_fn=progress_fn,
         eval_env=eval_env,
         policy_params_fn=policy_params_fn,
         **checkpoint_kwargs
