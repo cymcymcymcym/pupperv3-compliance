@@ -258,7 +258,7 @@ def main():
     
     # EMA smoothing for predictions
     smoothed_prediction = np.zeros(3)
-    prediction_smoothing = 0.5
+    prediction_smoothing = 0.2
     
     print(f"Running {args.num_steps} steps...")
     
