@@ -114,8 +114,8 @@ class PupperV3Env(PipelineEnv):
         kick_vel: float = 0.2,
         kick_probability: float = 0.02,
         force_probability: float = 0.8,
-        force_duration_range: jax.Array = jp.array([50, 150]),
-        force_magnitude_range: jax.Array = jp.array([5, 15]),
+        force_duration_range: jax.Array = jp.array([40, 120]),
+        force_magnitude_range: jax.Array = jp.array([2, 6]),
         force_application_point: jax.Array = jp.array([0.05, 0.0, 0.12]), #body frame, was jp.array([0.05, 0.0, 0.12]) before
         force_point_noise_sd: float = 0.05,
         terminal_body_z: float = 0.1,
