@@ -153,10 +153,11 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         4. Run parent step (which computes tracking_lin_vel reward)
         """
         # Get force (estimated or ground truth)
-        if self._use_ground_truth_force:
-            force = state.info['force_current_vector']
-        else:
-            force = self._estimate_force(state.obs)
+        force = jp.where(
+            self._use_ground_truth_force,
+            state.info['force_current_vector'],
+            self._estimate_force(state.obs)
+        )
         
         # Convert force to velocity command
         velocity_command = self._force_to_velocity_command(force)
@@ -168,11 +169,14 @@ class PupperV3EnvWithEstimator(PupperV3Env):
             jp.array([self._linear_velocity_x_range[1], self._linear_velocity_y_range[1], 2.0])
         )
         
-        # Override the command with admittance-derived velocity
-        state.info['command'] = velocity_command
+        # Update state.info using functional update (JAX-compatible)
+        # Create new info dict with updated values
+        new_info = {**state.info}
+        new_info['command'] = velocity_command
+        new_info['estimated_force'] = force
         
-        # Store estimated force for logging/debugging
-        state.info['estimated_force'] = force
+        # Replace state with updated info
+        state = state.replace(info=new_info)
         
         # Call parent step (uses tracking_lin_vel reward with our velocity command)
         return super().step(state, action)
@@ -181,11 +185,10 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         """Reset with additional info fields for force estimation."""
         state = super().reset(rng)
         
-        # Initialize estimated force field
-        state.info['estimated_force'] = jp.zeros(3)
+        # Update info using functional update (JAX-compatible)
+        new_info = {**state.info}
+        new_info['estimated_force'] = jp.zeros(3)
+        new_info['command'] = jp.zeros(3)
         
-        # Set initial command to zero (will be overwritten in first step)
-        state.info['command'] = jp.zeros(3)
-        
-        return state
+        return state.replace(info=new_info)
 

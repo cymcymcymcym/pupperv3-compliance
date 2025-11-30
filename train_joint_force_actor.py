@@ -459,21 +459,26 @@ def main():
     
     def policy_params_fn(current_step, make_policy, params):
         """Save checkpoints and visualize policy."""
-        utils.visualize_policy(
-            current_step=current_step,
-            make_policy=make_policy,
-            params=params,
-            eval_env=eval_env,
-            jit_step=jit_step,
-            jit_reset=jit_reset,
-            output_folder=output_folder
-        )
+        try:
+            utils.visualize_policy(
+                current_step=current_step,
+                make_policy=make_policy,
+                params=params,
+                eval_env=eval_env,
+                jit_step=jit_step,
+                jit_reset=jit_reset,
+                output_folder=output_folder
+            )
+        except Exception as e:
+            print(f"  Warning: Video rendering failed: {e}")
+        
         utils.save_checkpoint(
             current_step=current_step,
             make_policy=make_policy,
             params=params,
             checkpoint_path=output_folder
         )
+        print(f"  Checkpoint saved at step {current_step}")
     
     # Setup checkpoint restoration
     checkpoint_kwargs = {}
