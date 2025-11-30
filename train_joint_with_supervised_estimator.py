@@ -432,7 +432,12 @@ def collect_data_with_policy(
     state = jit_reset(reset_rng)
     
     steps_collected = 0
+    total_steps = 0
+    last_print = 0
+    
     while steps_collected < num_steps:
+        total_steps += 1
+        
         # Get action
         rng, act_rng = jax.random.split(rng)
         action, _ = jit_inference(state.obs, act_rng)
@@ -451,13 +456,32 @@ def collect_data_with_policy(
             force_list.append(force)
             steps_collected += 1
         
-        # Reset if done
-        if state.done.any():
+        # Reset if done (handle both scalar and array done)
+        done = state.done
+        if hasattr(done, 'any'):
+            should_reset = done.any()
+        else:
+            should_reset = bool(done)
+        
+        if should_reset:
             rng, reset_rng = jax.random.split(rng)
             state = jit_reset(reset_rng)
         
-        if steps_collected % 10000 == 0:
-            print(f"    Collected {steps_collected}/{num_steps} samples")
+        # Print progress
+        if steps_collected >= last_print + 10000 or (total_steps % 50000 == 0 and total_steps > 0):
+            print(f"    Collected {steps_collected}/{num_steps} samples (total steps: {total_steps}, force_mag: {force_mag:.3f})")
+            last_print = (steps_collected // 10000) * 10000
+        
+        # Safety: if we've done way more steps than expected, something is wrong
+        if total_steps > num_steps * 20 and steps_collected < 100:
+            print(f"    WARNING: Ran {total_steps} steps but only collected {steps_collected} samples")
+            print(f"    Last force magnitude: {force_mag:.6f}")
+            print(f"    Force vector: {force}")
+            break
+    
+    if len(obs_list) == 0:
+        print("    ERROR: No samples collected! Forces may all be zero.")
+        return np.array([]), np.array([])
     
     return np.array(obs_list), np.array(force_list)
 
@@ -660,19 +684,21 @@ def main():
                 except:
                     pass
         
-        # Video rendering
-        jit_reset = jax.jit(eval_env.reset)
-        jit_step = jax.jit(eval_env.step)
-        
+        # Video rendering - create fresh env inside callback to avoid tracer leak
         def policy_params_fn(current_step, make_policy, params):
             try:
+                # Create FRESH environment for video rendering (avoid tracer leak)
+                video_env = create_env()
+                video_jit_reset = jax.jit(video_env.reset)
+                video_jit_step = jax.jit(video_env.step)
+                
                 utils.visualize_policy(
                     current_step=current_step,
                     make_policy=make_policy,
                     params=params,
-                    eval_env=eval_env,
-                    jit_step=jit_step,
-                    jit_reset=jit_reset,
+                    eval_env=video_env,
+                    jit_step=video_jit_step,
+                    jit_reset=video_jit_reset,
                     output_folder=str(round_folder)
                 )
             except Exception as e:
