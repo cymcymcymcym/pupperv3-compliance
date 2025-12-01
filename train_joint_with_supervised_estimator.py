@@ -785,20 +785,30 @@ def main():
             except Exception as e:
                 print(f"  Video rendering failed: {e}")
         
-        # Checkpoint loading - only restore from initial checkpoint on round 0
-        # For subsequent rounds, train from scratch (but with improved force estimator)
+        # Checkpoint loading - restore from previous round's checkpoint (or initial checkpoint for round 0)
         checkpoint_kwargs = {}
-        if round_idx == 0 and initial_actor_checkpoint:
-            checkpoint_path = Path(initial_actor_checkpoint)
-            if not checkpoint_path.is_absolute():
-                checkpoint_path = Path.cwd() / checkpoint_path
-            if checkpoint_path.exists():
-                print(f"  Restoring actor from: {checkpoint_path}")
-                checkpoint_kwargs["restore_checkpoint_path"] = checkpoint_path
+        if round_idx == 0:
+            # Round 0: Use initial checkpoint if provided
+            if initial_actor_checkpoint:
+                checkpoint_path = Path(initial_actor_checkpoint)
+                if not checkpoint_path.is_absolute():
+                    checkpoint_path = Path.cwd() / checkpoint_path
+                if checkpoint_path.exists():
+                    print(f"  Restoring actor from initial checkpoint: {checkpoint_path}")
+                    checkpoint_kwargs["restore_checkpoint_path"] = checkpoint_path
+                else:
+                    print(f"  Warning: Initial checkpoint not found: {checkpoint_path}, training from scratch")
             else:
-                print(f"  Warning: Checkpoint not found: {checkpoint_path}")
+                print(f"  No initial checkpoint provided, training from scratch")
         else:
-            print(f"  Training actor from scratch (round {round_idx + 1}, with updated force estimator)")
+            # Subsequent rounds: Load from previous round's checkpoint
+            prev_round_folder = output_folder / f"round_{round_idx - 1}"
+            prev_checkpoint_path = (prev_round_folder / "actor_checkpoint").resolve()
+            if prev_checkpoint_path.exists():
+                print(f"  Restoring actor from previous round: {prev_checkpoint_path}")
+                checkpoint_kwargs["restore_checkpoint_path"] = prev_checkpoint_path
+            else:
+                print(f"  Warning: Previous round checkpoint not found: {prev_checkpoint_path}, training from scratch")
         
         # Train
         make_inference_fn, actor_params, _ = train_fn(
