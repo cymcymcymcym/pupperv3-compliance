@@ -569,6 +569,8 @@ def main():
                         help="Disable WandB logging")
     parser.add_argument("--wandb-project", type=str, default="pupperv3-compliance-joint",
                         help="WandB project name")
+    parser.add_argument("--no-video", action="store_true",
+                        help="Disable video rendering (useful for headless servers without EGL)")
     
     args = parser.parse_args()
     
@@ -724,6 +726,8 @@ def main():
         
         # Video rendering - create fresh env inside callback to avoid tracer leak
         def policy_params_fn(current_step, make_policy, params):
+            if args.no_video:
+                return  # Skip video rendering
             try:
                 # Create FRESH environment for video rendering (avoid tracer leak)
                 video_env = create_env()
