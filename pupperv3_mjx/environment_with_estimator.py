@@ -11,15 +11,19 @@ force estimates, making it robust to estimator errors.
 """
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+import os
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 
 import jax
 from jax import numpy as jp
 import numpy as np
+import mujoco
 
 from brax import math
-from pupperv3_mjx.environment import PupperV3Env
+from brax.envs import base
 from brax.envs.base import State
+
+from pupperv3_mjx.environment import PupperV3Env
 
 
 def load_force_estimator(json_path: str) -> Dict[str, Any]:
@@ -94,8 +98,8 @@ class PupperV3EnvWithEstimator(PupperV3Env):
     4. Reward is based on tracking GROUND TRUTH velocity (not estimated)
     
     Key insight:
-    - Force estimator sees: IMU + motors + action (30 dims) - NO command
-    - Actor sees: IMU + motors + action + COMMAND FROM ESTIMATOR (33 dims)
+    - Force estimator sees: full 36-dim frame with command/orientation slots zeroed out
+    - Actor sees: IMU + estimator command + desired orientation + motors + action (36 dims)
     - Reward tracks: Ground truth velocity (from ground truth force)
     """
     
@@ -117,12 +121,17 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         self._force_estimator = load_force_estimator(force_estimator_path)
         self._admittance_gains = jp.array(admittance_gains)
         
-        # Override observation dim: base (30) + command (3) = 33
-        self.observation_dim = 33
+        # Override observation dim to match original actor checkpoint (36 dims per frame)
+        # Layout per frame: IMU(6) | velocity command(3) | desired orientation(3) | motors(12) | last action(12)
+        self.observation_dim = 36
         
+        self._estimator_history = 10
+
         print(f"Loaded force estimator from {force_estimator_path}")
         print(f"Admittance gains: x={admittance_gains[0]}, y={admittance_gains[1]} m/s per N")
-        print(f"Actor observation: 33 dims (includes velocity command from estimator)")
+        print(f"Actor observation: 36 dims (estimator command + orientation + proprioception)")
+        print(f"Force estimator history: {self._estimator_history} frames "
+              f"({self._estimator_history * self.observation_dim} dims)")
         print(f"Reward uses GROUND TRUTH force (not estimated)")
     
     def _estimate_force(self, obs: jax.Array) -> jax.Array:
@@ -176,11 +185,8 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         # Get body rotation for frame conversion
         body_rotation = state.pipeline_state.x.rot[self._torso_idx]
         
-        # 1. Run force estimator on observation (obs doesn't include command yet)
-        #    Note: state.obs here is from previous step, which has estimated_command from prev step
-        #    We need to extract the base observation (without command) for the force estimator
-        #    The force estimator was trained on 30-dim obs (no command)
-        estimated_force = self._estimate_force_from_base_obs(state)
+        # 1. Run force estimator on observation history (command/orientation slots masked to zero)
+        estimated_force = self._estimate_force_from_observation(state)
         
         # 2. Convert estimated force → velocity command (this goes into ACTOR's observation)
         estimated_command = self._force_to_velocity_command(estimated_force, body_rotation)
@@ -211,40 +217,23 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         # Call parent step (reward uses ground_truth_command via state.info['command'])
         return super().step(state, action)
     
-    def _estimate_force_from_base_obs(self, state: State) -> jax.Array:
-        """Extract base observation (without command) and run force estimator.
-        
-        The force estimator was trained on 30-dim observations:
-        - IMU (6) + motor angles (12) + last action (12) = 30 dims per frame
-        
-        But actor observation is 33 dims (includes command).
-        We need to extract just the base 30 dims for the estimator.
-        """
-        # state.obs is [obs_dim * history] = [33 * 20] = 660 for actor
-        # We need to extract [30 * 20] = 600 for force estimator
-        
-        # Each frame is 33 dims: [imu(6), command(3), motors(12), action(12)]
-        # Force estimator expects: [imu(6), motors(12), action(12)] = 30 dims
-        
-        obs_history = self._observation_history
-        actor_frame_dim = 33  # IMU(6) + cmd(3) + motors(12) + action(12)
-        estimator_frame_dim = 30  # IMU(6) + motors(12) + action(12)
-        
-        # Extract base observation for each frame
-        def extract_base_frame(frame_obs):
-            # frame_obs is [33]: [imu(6), cmd(3), motors(12), action(12)]
-            # Return [30]: [imu(6), motors(12), action(12)]
-            imu = frame_obs[:6]
-            motors = frame_obs[9:21]  # Skip command (indices 6-8)
-            action = frame_obs[21:33]
-            return jp.concatenate([imu, motors, action])
-        
-        # Reshape to [history, frame_dim], extract, reshape back
-        obs_frames = state.obs.reshape(obs_history, actor_frame_dim)
-        base_frames = jax.vmap(extract_base_frame)(obs_frames)
-        base_obs = base_frames.reshape(-1)  # [30 * 20] = 600
-        
-        return apply_force_estimator(base_obs, self._force_estimator)
+    def _estimate_force_from_observation(self, state: State) -> jax.Array:
+        """Mask command/orientation slots and run force estimator on 36-dim frames."""
+        obs_frames = state.obs.reshape(self._observation_history, self.observation_dim)
+
+        frames_to_use = min(self._estimator_history, self._observation_history)
+        recent_frames = obs_frames[-frames_to_use:]
+
+        def mask_frame(frame_obs):
+            # Zero out command (indices 6:9) and orientation (indices 9:12) before feeding estimator
+            frame_obs = frame_obs.at[6:9].set(0.0)
+            frame_obs = frame_obs.at[9:12].set(0.0)
+            return frame_obs
+
+        masked_frames = jax.vmap(mask_frame)(recent_frames)
+        estimator_input = masked_frames.reshape(-1)  # 36 dims × estimator_history
+
+        return apply_force_estimator(estimator_input, self._force_estimator)
     
     def reset(self, rng: jax.Array) -> State:
         """Reset with additional info fields for force estimation."""
@@ -266,11 +255,12 @@ class PupperV3EnvWithEstimator(PupperV3Env):
     ) -> jax.Array:
         """Get observation for ACTOR - includes velocity command from estimator.
         
-        Actor observation (33 dims per frame):
+        Actor observation (36 dims per frame):
         - IMU data (angular velocity, gravity) - 6 dims
+        - Velocity command from estimator - 3 dims
+        - Desired orientation (world z in body frame) - 3 dims
         - Motor angles - 12 dims
         - Last action - 12 dims
-        - Velocity command from estimator - 3 dims  <-- This is what actor needs to track!
         """
         from pupperv3_mjx import utils
         
@@ -318,20 +308,24 @@ class PupperV3EnvWithEstimator(PupperV3Env):
             self._imu_latency_distribution,
         )
 
-        # Get velocity command from estimator (this is what actor should track)
+        # Velocity command from estimator (actor tracks this)
         # Note: estimated_command is set in step() from force estimator output
         estimated_command = state_info.get('estimated_command', jp.zeros(3))
+
+        # Desired orientation command (same as base environment)
+        desired_orientation = state_info.get('desired_world_z_in_body_frame', jp.zeros(3))
 
         # Construct observation WITH command from estimator
         obs = jp.concatenate(
             [
                 lagged_imu_data,  # 6 dims: angular velocity + gravity
-                estimated_command,  # 3 dims: velocity command FROM ESTIMATOR (actor tracks this!)
+                estimated_command,  # 3 dims: velocity command from estimator
+                desired_orientation,  # 3 dims: desired world z in body frame
                 pipeline_state.q[7:] - self._default_pose + motor_ang_noise,  # 12 dims: motor angles
                 state_info["last_act"] + last_action_noise,  # 12 dims: last action
             ]
         )
-        # Total: 6 + 3 + 12 + 12 = 33 dims per frame
+        # Total: 6 + 3 + 3 + 12 + 12 = 36 dims per frame
 
         obs = jp.clip(obs, -100.0, 100.0)
 
@@ -339,4 +333,80 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         new_obs_history = jp.roll(obs_history, obs.size).at[: obs.size].set(obs)
 
         return new_obs_history
+
+    def render(
+        self,
+        trajectory: Sequence[base.State],
+        camera: Optional[str] = None,
+        force_vis_scale: float = 0.05,
+    ) -> Sequence[np.ndarray]:
+        """Render frames with both ground truth (red) and estimated (blue) forces."""
+        if not trajectory:
+            return []
+
+        # If we were handed plain pipeline states (legacy path), fall back to base class.
+        if not hasattr(trajectory[0], "pipeline_state"):
+            return super().render(trajectory, camera=camera, force_vis_scale=force_vis_scale)
+
+        camera = camera or "tracking_cam"
+        width, height = 640, 480
+        os.environ.setdefault("MUJOCO_GL", "egl")
+        model = self.sys.mj_model
+        renderer: Optional[mujoco.Renderer] = None
+        gl_context: Optional[mujoco.GLContext] = None
+        frames: List[np.ndarray] = []
+
+        try:
+            try:
+                gl_context = mujoco.GLContext(max_width=width, max_height=height)
+            except mujoco.FatalError:
+                os.environ["MUJOCO_GL"] = "osmesa"
+                gl_context = mujoco.GLContext(max_width=width, max_height=height)
+            gl_context.make_current()
+            renderer = mujoco.Renderer(model, height=height, width=width)
+
+            for state in trajectory:
+                pipeline_state = state.pipeline_state
+                data = mujoco.MjData(model)
+                mujoco.mj_resetData(model, data)
+                data.qpos[:] = np.asarray(pipeline_state.q)
+                data.qvel[:] = np.asarray(pipeline_state.qd)
+                data.xfrc_applied[:] = np.asarray(pipeline_state.xfrc_applied)
+                mujoco.mj_forward(model, data)
+
+                renderer.update_scene(data, camera=camera)
+
+                torso_pos = data.xpos[self._torso_body_id]
+                origin = torso_pos + np.array([0.0, 0.0, 0.35])
+
+                # Ground truth force (red)
+                gt_force = np.asarray(data.xfrc_applied[self._torso_body_id, :3])
+                if np.linalg.norm(gt_force) > 0.1:
+                    self._draw_force_arrow(
+                        renderer,
+                        origin,
+                        gt_force,
+                        scale=force_vis_scale,
+                        rgba=(1.0, 0.0, 0.0, 1.0),
+                    )
+
+                # Estimated force (blue)
+                est_force = np.asarray(state.info.get("estimated_force", np.zeros(3)))
+                if np.linalg.norm(est_force) > 0.1:
+                    self._draw_force_arrow(
+                        renderer,
+                        origin,
+                        est_force,
+                        scale=force_vis_scale,
+                        rgba=(0.0, 0.45, 1.0, 0.9),
+                    )
+
+                frames.append(renderer.render())
+        finally:
+            if renderer is not None:
+                renderer.close()
+            if gl_context is not None:
+                gl_context.free()
+
+        return frames
 

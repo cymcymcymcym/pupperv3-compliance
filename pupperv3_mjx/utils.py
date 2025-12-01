@@ -253,7 +253,7 @@ def visualize_policy(
     new_info = {k: v for k, v in state.info.items()}
     new_info["command"] = command_seq[0]
     state = state.replace(info=new_info)
-    rollout = [state.pipeline_state]
+    rollout = [state]
 
     # grab a trajectory
     n_steps = 560
@@ -270,7 +270,7 @@ def visualize_policy(
 
         ctrl, _ = jit_inference_fn(state.obs, act_rng)
         state = jit_step(state, ctrl)
-        rollout.append(state.pipeline_state)
+        rollout.append(state)
         ctrls.append(ctrl)
 
     filename = os.path.join(output_folder, f"step_{current_step}_policy.mp4")

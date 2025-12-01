@@ -30,7 +30,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple, List, Optional
 
 # Set EGL for headless rendering BEFORE importing mujoco
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -63,6 +63,8 @@ except ImportError:
 # ============================================================================
 # Force Estimator Network (matches the pretrained architecture)
 # ============================================================================
+
+ESTIMATOR_FRAMES = 10  # force estimator uses last N frames (actor still sees full 20)
 
 class ForceEstimatorNetwork(nn.Module):
     """Flax MLP for force estimation - matches ForceEstimatorLarge."""
@@ -172,6 +174,43 @@ def export_force_estimator(params: Dict, input_mean: np.ndarray, input_std: np.n
 
 
 # ============================================================================
+# Observation Utilities
+# ============================================================================
+
+def mask_command_orientation_features(
+    array: np.ndarray,
+    frame_dim: int = 36,
+    frames_to_keep: Optional[int] = None,
+) -> np.ndarray:
+    """Slice to last frames_to_keep (if provided) and zero command/orientation slots."""
+    if array.size == 0:
+        return array
+
+    def process_nd(arr_1d: np.ndarray) -> np.ndarray:
+        history = arr_1d.shape[0] // frame_dim
+        frames = arr_1d.reshape(history, frame_dim)
+        if frames_to_keep is not None:
+            frames = frames[-frames_to_keep:]
+        masked = frames.copy()
+        masked[:, 6:12] = 0.0
+        return masked.reshape(-1)
+
+    if array.ndim == 1:
+        return process_nd(array)
+
+    if array.ndim == 2:
+        history = array.shape[1] // frame_dim
+        frames = array.reshape(array.shape[0], history, frame_dim)
+        if frames_to_keep is not None:
+            frames = frames[:, -frames_to_keep:, :]
+        masked = frames.copy()
+        masked[:, :, 6:12] = 0.0
+        return masked.reshape(array.shape[0], -1)
+
+    raise ValueError(f"Unsupported array shape for masking: {array.shape}")
+
+
+# ============================================================================
 # Supervised Training for Force Estimator
 # ============================================================================
 
@@ -186,15 +225,43 @@ def train_force_estimator_supervised(
     learning_rate: float = 1e-4,
     direction_weight: float = 0.8,
     magnitude_weight: float = 0.2,
-) -> Dict:
+) -> Tuple[Dict, np.ndarray, np.ndarray]:
     """Train force estimator with supervised learning."""
     print(f"  Training force estimator on {len(obs_data)} samples...")
     
-    # Handle zero std
+    if len(obs_data) == 0:
+        return params, input_mean, input_std
+    
+    obs_masked = mask_command_orientation_features(
+        obs_data, frames_to_keep=ESTIMATOR_FRAMES
+    )
+    masked_mean = mask_command_orientation_features(
+        input_mean, frames_to_keep=ESTIMATOR_FRAMES
+    )
+    masked_std = mask_command_orientation_features(
+        input_std, frames_to_keep=ESTIMATOR_FRAMES
+    )
+    
+    expected_dim = ESTIMATOR_FRAMES * 36
+    if obs_masked.shape[1] != expected_dim:
+        raise ValueError(
+            f"Estimator observations must have {expected_dim} dims "
+            f"(got {obs_masked.shape[1]}). Check ESTIMATOR_FRAMES."
+        )
+    if masked_mean.shape[0] != expected_dim:
+        raise ValueError(
+            f"input_mean must have {expected_dim} dims for "
+            f"{ESTIMATOR_FRAMES} frames (got {masked_mean.shape[0]})."
+        )
+    
+    input_mean = masked_mean.astype(np.float32, copy=False)
+    input_std = masked_std.astype(np.float32, copy=False)
+    
+    # Handle zero std (after masking)
     input_std_safe = np.where(input_std < 1e-6, 1.0, input_std)
     
     # Normalize observations
-    obs_norm = (obs_data - input_mean) / input_std_safe
+    obs_norm = (obs_masked - input_mean) / input_std_safe
     
     # Create optimizer
     optimizer = optax.adam(learning_rate)
@@ -278,7 +345,7 @@ def train_force_estimator_supervised(
             print(f"    Epoch {epoch+1}/{num_epochs}: loss = {avg_loss:.6f}")
     
     print(f"  Best loss: {best_loss:.6f}")
-    return best_params
+    return best_params, input_mean, input_std
 
 
 # ============================================================================
@@ -665,6 +732,13 @@ def main():
     print("\nLoading force estimator...")
     fe_params, input_mean, input_std = load_estimator_from_json(args.force_estimator_path)
     print(f"  Input dim: {len(input_mean)}")
+    expected_dim = ESTIMATOR_FRAMES * 36
+    if len(input_mean) != expected_dim:
+        raise ValueError(
+            f"Force estimator input dim mismatch. Expected {expected_dim} "
+            f"(36 dims × {ESTIMATOR_FRAMES} frames), got {len(input_mean)}. "
+            "Please provide a checkpoint trained for the new history length."
+        )
     
     # Track actor checkpoint path
     # Note: We only restore from the INITIAL checkpoint (morning-jazz-49) on round 0
@@ -701,7 +775,7 @@ def main():
                 path=args.model_path,
                 reward_config=reward_config,
                 action_scale=0.3,
-                observation_history=20,  # 20 frames × 30 dims = 600 dim observation
+                observation_history=20,  # 20 frames × 36 dims = 720-dim observation
                 joint_lower_limits=sim_config.joint_lower_limits,
                 joint_upper_limits=sim_config.joint_upper_limits,
                 torso_name=sim_config.torso_name,
@@ -892,7 +966,7 @@ def main():
         if len(obs_data) < 1000:
             print("  Warning: Not enough data collected, skipping estimator update")
         else:
-            fe_params = train_force_estimator_supervised(
+            fe_params, input_mean, input_std = train_force_estimator_supervised(
                 params=fe_params,
                 input_mean=input_mean,
                 input_std=input_std,

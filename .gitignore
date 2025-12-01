@@ -8,3 +8,5 @@ train_leash.py
 videos/
 final_actor_checkpoint/
 final_force_estimator.json
+wandb/
+output_pure_rl_compliance_2025-12-01_00-39-18/
