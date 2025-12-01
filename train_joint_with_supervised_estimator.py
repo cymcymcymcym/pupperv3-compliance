@@ -763,8 +763,16 @@ def main():
                 except:
                     pass
         
-        # Video rendering - create fresh env inside callback to avoid tracer leak
+        # Track the latest full params (including value network) for checkpoint saving
+        # This is needed because train_fn only returns policy params, not value params
+        latest_full_params = [None]  # Use list to allow mutation in nested function
+        
+        # Video rendering and checkpoint saving - inside callback to get full params
         def policy_params_fn(current_step, make_policy, params):
+            # params here is (normalizer_params, full_network_params) including value network!
+            # Save it for later checkpoint saving
+            latest_full_params[0] = params
+            
             if args.no_video:
                 return  # Skip video rendering
             try:
@@ -785,8 +793,9 @@ def main():
             except Exception as e:
                 print(f"  Video rendering failed: {e}")
         
-        # Checkpoint loading - restore from previous round's checkpoint (or initial checkpoint for round 0)
+        # Checkpoint loading - restore from previous round OR initial checkpoint
         checkpoint_kwargs = {}
+        
         if round_idx == 0:
             # Round 0: Use initial checkpoint if provided
             if initial_actor_checkpoint:
@@ -801,14 +810,22 @@ def main():
             else:
                 print(f"  No initial checkpoint provided, training from scratch")
         else:
-            # Subsequent rounds: Load from previous round's checkpoint
+            # Subsequent rounds: Load from previous round's checkpoint (saved with full params)
             prev_round_folder = output_folder / f"round_{round_idx - 1}"
             prev_checkpoint_path = (prev_round_folder / "actor_checkpoint").resolve()
             if prev_checkpoint_path.exists():
                 print(f"  Restoring actor from previous round: {prev_checkpoint_path}")
                 checkpoint_kwargs["restore_checkpoint_path"] = prev_checkpoint_path
+            elif initial_actor_checkpoint:
+                # Fallback to initial checkpoint
+                checkpoint_path = Path(initial_actor_checkpoint)
+                if not checkpoint_path.is_absolute():
+                    checkpoint_path = Path.cwd() / checkpoint_path
+                if checkpoint_path.exists():
+                    print(f"  Warning: Previous round checkpoint not found, using initial: {checkpoint_path}")
+                    checkpoint_kwargs["restore_checkpoint_path"] = checkpoint_path
             else:
-                print(f"  Warning: Previous round checkpoint not found: {prev_checkpoint_path}, training from scratch")
+                print(f"  Warning: No checkpoint found, training from scratch")
         
         # Train
         make_inference_fn, actor_params, _ = train_fn(
@@ -819,17 +836,20 @@ def main():
             **checkpoint_kwargs
         )
         
-        # Save actor checkpoint using Orbax (same format as PPO uses internally)
-        # actor_params is (normalizer_params, policy_params) tuple from train_fn
+        # Save actor checkpoint using FULL params (including value network)
+        # We captured this in policy_params_fn callback because train_fn only returns policy params
         # NOTE: Orbax requires ABSOLUTE paths
         actor_checkpoint_path = (round_folder / "actor_checkpoint").resolve()
-        orbax_checkpointer = ocp.PyTreeCheckpointer()
-        orbax_checkpointer.save(
-            str(actor_checkpoint_path), 
-            actor_params,
-            force=True  # Overwrite if exists
-        )
-        print(f"  Saved actor checkpoint to {actor_checkpoint_path}")
+        if latest_full_params[0] is not None:
+            orbax_checkpointer = ocp.PyTreeCheckpointer()
+            orbax_checkpointer.save(
+                str(actor_checkpoint_path), 
+                latest_full_params[0],  # Use full params (normalizer + policy + value)
+                force=True  # Overwrite if exists
+            )
+            print(f"  Saved actor checkpoint to {actor_checkpoint_path}")
+        else:
+            print(f"  Warning: No full params captured, skipping checkpoint save")
         
         # Note: Policy JSON export skipped (use checkpoint for inference)
         # The Brax checkpoint can be loaded directly for inference
