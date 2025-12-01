@@ -232,14 +232,24 @@ def train_force_estimator_supervised(
     if len(obs_data) == 0:
         return params, input_mean, input_std
     
+    # ========== NaN FILTERING ==========
+    # Check for NaN/Inf in input data and filter them out
+    obs_valid = np.isfinite(obs_data).all(axis=1)
+    force_valid = np.isfinite(force_data).all(axis=1)
+    valid_mask = obs_valid & force_valid
+    
+    num_invalid = (~valid_mask).sum()
+    if num_invalid > 0:
+        print(f"  WARNING: Filtering out {num_invalid} samples with NaN/Inf values")
+        obs_data = obs_data[valid_mask]
+        force_data = force_data[valid_mask]
+    
+    if len(obs_data) == 0:
+        print("  ERROR: All samples were NaN/Inf!")
+        return params, input_mean, input_std
+    
     obs_masked = mask_command_orientation_features(
         obs_data, frames_to_keep=ESTIMATOR_FRAMES
-    )
-    masked_mean = mask_command_orientation_features(
-        input_mean, frames_to_keep=ESTIMATOR_FRAMES
-    )
-    masked_std = mask_command_orientation_features(
-        input_std, frames_to_keep=ESTIMATOR_FRAMES
     )
     
     expected_dim = ESTIMATOR_FRAMES * 36
@@ -248,23 +258,31 @@ def train_force_estimator_supervised(
             f"Estimator observations must have {expected_dim} dims "
             f"(got {obs_masked.shape[1]}). Check ESTIMATOR_FRAMES."
         )
-    if masked_mean.shape[0] != expected_dim:
-        raise ValueError(
-            f"input_mean must have {expected_dim} dims for "
-            f"{ESTIMATOR_FRAMES} frames (got {masked_mean.shape[0]})."
-        )
     
-    input_mean = masked_mean.astype(np.float32, copy=False)
-    input_std = masked_std.astype(np.float32, copy=False)
+    # ========== COMPUTE NORMALIZATION STATS FROM DATA ==========
+    # Always recompute stats from actual data (don't use placeholder values)
+    input_mean = obs_masked.mean(axis=0).astype(np.float32)
+    input_std = obs_masked.std(axis=0).astype(np.float32)
     
-    # Handle zero std (after masking)
+    # Handle zero std
     input_std_safe = np.where(input_std < 1e-6, 1.0, input_std)
+    
+    print(f"  Normalization stats: mean range [{input_mean.min():.4f}, {input_mean.max():.4f}], "
+          f"std range [{input_std.min():.4f}, {input_std.max():.4f}]")
     
     # Normalize observations
     obs_norm = (obs_masked - input_mean) / input_std_safe
     
-    # Create optimizer
-    optimizer = optax.adam(learning_rate)
+    # Verify normalized data
+    if not np.isfinite(obs_norm).all():
+        print("  ERROR: Normalized observations contain NaN/Inf!")
+        return params, input_mean, input_std
+    
+    # Create optimizer with gradient clipping
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Gradient clipping to prevent explosion
+        optax.adam(learning_rate)
+    )
     opt_state = optimizer.init(params)
     
     # Infer hidden sizes from params
@@ -279,21 +297,33 @@ def train_force_estimator_supervised(
     def loss_fn(params, obs_batch, force_batch):
         pred = model.apply({'params': params}, obs_batch, train=True)
         
+        # Clip predictions to prevent extreme values
+        pred = jp.clip(pred, -1000.0, 1000.0)
+        
         # Direction loss (cosine similarity)
         pred_norm = jp.linalg.norm(pred, axis=-1, keepdims=True) + 1e-6
         target_norm = jp.linalg.norm(force_batch, axis=-1, keepdims=True) + 1e-6
         pred_unit = pred / pred_norm
         target_unit = force_batch / target_norm
         cosine_sim = jp.sum(pred_unit * target_unit, axis=-1)
-        target_mag = target_norm.squeeze()
+        
+        # Clamp cosine similarity to valid range
+        cosine_sim = jp.clip(cosine_sim, -1.0, 1.0)
+        
+        target_mag = target_norm.squeeze(-1)  # Use squeeze(-1) to be explicit about axis
         has_force = target_mag > 0.1
-        direction_loss = jp.mean(jp.where(has_force, 1.0 - cosine_sim, 0.0))
+        num_with_force = jp.sum(has_force)
+        direction_loss = jp.sum(jp.where(has_force, 1.0 - cosine_sim, 0.0)) / jp.maximum(num_with_force, 1.0)
         
-        # Magnitude loss
-        pred_mag = pred_norm.squeeze()
-        magnitude_loss = jp.mean((pred_mag - target_mag) ** 2)
+        # Magnitude loss (MSE on clipped values)
+        pred_mag = jp.clip(pred_norm.squeeze(-1), 0.0, 100.0)
+        target_mag_clipped = jp.clip(target_mag, 0.0, 100.0)
+        magnitude_loss = jp.mean((pred_mag - target_mag_clipped) ** 2)
         
-        return direction_weight * direction_loss + magnitude_weight * magnitude_loss
+        total_loss = direction_weight * direction_loss + magnitude_weight * magnitude_loss
+        
+        # Return 0 if loss is NaN (fallback)
+        return jp.where(jp.isfinite(total_loss), total_loss, 0.0)
     
     @jax.jit
     def train_step(params, opt_state, obs_batch, force_batch):
@@ -322,6 +352,7 @@ def train_force_estimator_supervised(
         perm = jax.random.permutation(perm_rng, num_samples)
         
         total_loss = 0.0
+        nan_batches = 0
         for i in range(num_batches):
             start = i * batch_size
             end = start + batch_size
@@ -332,17 +363,26 @@ def train_force_estimator_supervised(
             force_batch = force_gpu[batch_idx]
             
             params, opt_state, loss = train_step(params, opt_state, obs_batch, force_batch)
-            total_loss += float(loss)  # Small sync per batch, but simple
+            loss_val = float(loss)
+            
+            if np.isfinite(loss_val):
+                total_loss += loss_val
+            else:
+                nan_batches += 1
+                if epoch == 0 and nan_batches <= 3:
+                    # Debug: print info about the problematic batch
+                    print(f"    WARNING: NaN loss at batch {i}, obs range: [{float(obs_batch.min()):.4f}, {float(obs_batch.max()):.4f}]")
         
-        avg_loss = total_loss / max(1, num_batches)
+        avg_loss = total_loss / max(1, num_batches - nan_batches)
         
-        if avg_loss < best_loss:
+        if np.isfinite(avg_loss) and avg_loss < best_loss:
             best_loss = avg_loss
             # Only copy params when we have a new best (not every epoch)
             best_params = jax.tree.map(lambda x: np.array(x), params)
         
         if epoch % 10 == 0 or epoch == num_epochs - 1:
-            print(f"    Epoch {epoch+1}/{num_epochs}: loss = {avg_loss:.6f}")
+            nan_info = f" ({nan_batches} NaN batches)" if nan_batches > 0 else ""
+            print(f"    Epoch {epoch+1}/{num_epochs}: loss = {avg_loss:.6f}{nan_info}")
     
     print(f"  Best loss: {best_loss:.6f}")
     return best_params, input_mean, input_std
@@ -614,6 +654,17 @@ def collect_data_with_policy(
     # Concatenate all collected data
     all_obs = np.concatenate(obs_buffer_list, axis=0)
     all_forces = np.concatenate(force_buffer_list, axis=0)
+    
+    # Filter out NaN/Inf samples
+    obs_valid = np.isfinite(all_obs).all(axis=1)
+    force_valid = np.isfinite(all_forces).all(axis=1)
+    valid_mask = obs_valid & force_valid
+    
+    num_invalid = (~valid_mask).sum()
+    if num_invalid > 0:
+        print(f"    WARNING: Filtered out {num_invalid} samples with NaN/Inf values during collection")
+        all_obs = all_obs[valid_mask]
+        all_forces = all_forces[valid_mask]
     
     # Trim to exact number requested
     if len(all_obs) > num_steps:
