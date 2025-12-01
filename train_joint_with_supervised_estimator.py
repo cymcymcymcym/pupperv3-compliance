@@ -294,13 +294,9 @@ class DataCollector:
         self.force_list: List[np.ndarray] = []
     
     def add(self, obs: np.ndarray, force: np.ndarray):
-        """Add samples."""
-        # Filter out zero forces
-        force_mag = np.linalg.norm(force, axis=-1)
-        mask = force_mag > 0.1
-        if np.any(mask):
-            self.obs_list.append(obs[mask])
-            self.force_list.append(force[mask])
+        """Add samples (including zero-force samples)."""
+        self.obs_list.append(obs)
+        self.force_list.append(force)
         
         # Trim if too large
         total = sum(len(o) for o in self.obs_list)
@@ -454,13 +450,13 @@ def collect_data_with_policy(
     jit_step = jax.jit(batched_step)
     jit_inference = jax.jit(batched_inference)
     
-    # JIT-compiled function to filter valid samples on GPU
+    # JIT-compiled function to compute force stats (no filtering - keep all samples)
     @jax.jit
-    def filter_valid_samples(obs, force):
-        """Filter samples with non-zero force on GPU."""
+    def compute_force_stats(force):
+        """Compute force magnitudes for logging."""
         force_mags = jp.linalg.norm(force, axis=1)
-        valid_mask = force_mags > 0.1
-        return obs, force, valid_mask, force_mags
+        has_force = force_mags > 0.1
+        return force_mags, has_force
     
     rng = jax.random.PRNGKey(seed)
     
@@ -493,30 +489,26 @@ def collect_data_with_policy(
         # Get force vector (stay on GPU)
         force_gpu = state.info.get('force_current_vector', jp.zeros((num_parallel_envs, 3)))
         
-        # Filter on GPU
-        obs_filtered, force_filtered, valid_mask, force_mags = filter_valid_samples(
-            state.obs, force_gpu
-        )
+        # Compute stats for logging (no filtering - keep ALL samples including zero force)
+        force_mags, has_force = compute_force_stats(force_gpu)
         
-        # Accumulate on GPU
-        batch_obs_gpu.append(obs_filtered)
-        batch_force_gpu.append(force_filtered)
+        # Accumulate ALL samples on GPU (no filtering)
+        batch_obs_gpu.append(state.obs)
+        batch_force_gpu.append(force_gpu)
         
         # Transfer to CPU in batches (not every step)
         if len(batch_obs_gpu) >= collection_batch_size // num_parallel_envs:
-            # Concatenate on GPU then transfer
+            # Concatenate on GPU then transfer ALL samples (no filtering)
             all_obs = jp.concatenate(batch_obs_gpu, axis=0)
             all_force = jp.concatenate(batch_force_gpu, axis=0)
-            all_valid = jp.linalg.norm(all_force, axis=1) > 0.1
             
-            # Single GPU→CPU transfer
-            obs_cpu = np.array(all_obs[all_valid])
-            force_cpu = np.array(all_force[all_valid])
+            # Single GPU→CPU transfer (ALL samples, including zero force)
+            obs_cpu = np.array(all_obs)
+            force_cpu = np.array(all_force)
             
-            if len(obs_cpu) > 0:
-                obs_buffer_list.append(obs_cpu)
-                force_buffer_list.append(force_cpu)
-                steps_collected += len(obs_cpu)
+            obs_buffer_list.append(obs_cpu)
+            force_buffer_list.append(force_cpu)
+            steps_collected += len(obs_cpu)
             
             batch_obs_gpu = []
             batch_force_gpu = []
@@ -531,26 +523,22 @@ def collect_data_with_policy(
         # Print progress every ~50k steps
         if total_steps % (50000 // num_parallel_envs * num_parallel_envs) < num_parallel_envs:
             avg_force = float(jp.mean(force_mags))
-            valid_pct = float(jp.mean(valid_mask.astype(jp.float32))) * 100
+            has_force_pct = float(jp.mean(has_force.astype(jp.float32))) * 100
             print(f"    Collected {steps_collected}/{num_steps} samples "
-                  f"(total steps: {total_steps}, avg_force: {avg_force:.3f}, valid: {valid_pct:.1f}%)")
+                  f"(total steps: {total_steps}, avg_force: {avg_force:.3f}, has_force: {has_force_pct:.1f}%)")
         
-        # Safety check
-        if total_steps > num_steps * 20 and steps_collected < 100:
-            print(f"    WARNING: Ran {total_steps} steps but only collected {steps_collected} samples")
-            print(f"    Force magnitudes: min={float(jp.min(force_mags)):.6f}, max={float(jp.max(force_mags)):.6f}")
-            break
+        # Safety check (shouldn't trigger now since we keep all samples)
+        if total_steps > num_steps * 2:
+            break  # Collected enough
     
-    # Flush remaining GPU buffer
+    # Flush remaining GPU buffer (keep ALL samples including zero force)
     if batch_obs_gpu:
         all_obs = jp.concatenate(batch_obs_gpu, axis=0)
         all_force = jp.concatenate(batch_force_gpu, axis=0)
-        all_valid = jp.linalg.norm(all_force, axis=1) > 0.1
-        obs_cpu = np.array(all_obs[all_valid])
-        force_cpu = np.array(all_force[all_valid])
-        if len(obs_cpu) > 0:
-            obs_buffer_list.append(obs_cpu)
-            force_buffer_list.append(force_cpu)
+        obs_cpu = np.array(all_obs)
+        force_cpu = np.array(all_force)
+        obs_buffer_list.append(obs_cpu)
+        force_buffer_list.append(force_cpu)
     
     if len(obs_buffer_list) == 0:
         print("    ERROR: No samples collected! Forces may all be zero.")
