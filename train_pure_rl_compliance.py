@@ -55,14 +55,15 @@ class PupperV3EnvPureCompliance(PupperV3Env):
     Pure RL environment for compliance training.
     
     NO force in observation - robot must learn compliance from physical effects only.
-    Velocity command slot filled with NOISE (to match previous policy's observation size).
+    Velocity command and orientation slots filled with NOISE (to match original policy's obs size).
     
-    Observation (matches joint training actor observation):
+    Observation (matches original pupperv3-mjx policy):
     - IMU data (angular velocity, gravity) - 6 dims
     - Velocity command (NOISE - masked out) - 3 dims
+    - Desired orientation (NOISE - masked out) - 3 dims
     - Motor angles - 12 dims  
     - Last action - 12 dims
-    Total: 33 dims per frame × 20 frames = 660 dims
+    Total: 36 dims per frame × 20 frames = 720 dims
     
     Reward: Move at velocity proportional to applied force
     - desired_velocity = admittance_gain * force (computed internally for reward only)
@@ -78,13 +79,13 @@ class PupperV3EnvPureCompliance(PupperV3Env):
         super().__init__(**kwargs)
         self._admittance_gains = jp.array(admittance_gains)
         
-        # Observation dim: 33 (matches joint training for checkpoint compatibility)
-        # IMU (6) + command_noise (3) + motor angles (12) + last action (12) = 33
-        self.observation_dim = 33
+        # Observation dim: 36 (matches original pupperv3-mjx for checkpoint compatibility)
+        # IMU (6) + command_noise (3) + orientation_noise (3) + motor angles (12) + last action (12) = 36
+        self.observation_dim = 36
         
         print(f"Pure RL Compliance Environment")
         print(f"  Admittance gains: x={admittance_gains[0]}, y={admittance_gains[1]} m/s per N")
-        print(f"  Observation dim: {self.observation_dim} (command slot = NOISE)")
+        print(f"  Observation dim: {self.observation_dim} (command & orientation slots = NOISE)")
         print(f"  Robot learns compliance purely from physical feedback!")
     
     def reset(self, rng: jax.Array) -> State:
@@ -133,11 +134,12 @@ class PupperV3EnvPureCompliance(PupperV3Env):
         state_info: dict,
         obs_history: jax.Array,
     ) -> jax.Array:
-        """Get observation with NOISE in command slot (to match joint training obs size).
+        """Get observation with NOISE in command & orientation slots (to match original policy).
         
-        Observation (33 dims per frame):
+        Observation (36 dims per frame, matches original pupperv3-mjx):
         - IMU data (angular velocity, gravity) - 6 dims
         - Command slot (PURE NOISE) - 3 dims  <-- Robot must ignore this!
+        - Orientation slot (PURE NOISE) - 3 dims  <-- Robot must ignore this!
         - Motor angles - 12 dims
         - Last action - 12 dims
         """
@@ -156,8 +158,9 @@ class PupperV3EnvPureCompliance(PupperV3Env):
             motor_angle_key,
             last_action_key,
             imu_sample_key,
-            cmd_noise_key,  # New key for command noise
-        ) = jax.random.split(state_info["rng"], 7)
+            cmd_noise_key,
+            orient_noise_key,  # New key for orientation noise
+        ) = jax.random.split(state_info["rng"], 8)
 
         ang_vel_noise = (
             jax.random.uniform(ang_key, (3,), minval=-1, maxval=1) * self._angular_velocity_noise
@@ -181,6 +184,14 @@ class PupperV3EnvPureCompliance(PupperV3Env):
             minval=jp.array([-0.75, -0.5, -2.0]),
             maxval=jp.array([0.75, 0.5, 2.0])
         )
+        
+        # PURE NOISE for orientation slot - robot must learn to ignore this
+        # Range matches typical orientation values: [-1, 1] for unit vector components
+        orientation_noise = jax.random.uniform(
+            orient_noise_key, (3,),
+            minval=-1.0,
+            maxval=1.0
+        )
 
         noised_gravity = math.rotate(jp.array([0, 0, -1]), inv_torso_rot) + gravity_noise
         noised_gravity = noised_gravity / (jp.linalg.norm(noised_gravity) + 1e-6)
@@ -194,16 +205,17 @@ class PupperV3EnvPureCompliance(PupperV3Env):
             self._imu_latency_distribution,
         )
 
-        # Construct observation with NOISE in command slot
+        # Construct observation with NOISE in command & orientation slots
         obs = jp.concatenate(
             [
                 lagged_imu_data,  # 6 dims: angular velocity + gravity
                 command_noise,  # 3 dims: PURE NOISE (robot must ignore!)
+                orientation_noise,  # 3 dims: PURE NOISE (robot must ignore!)
                 pipeline_state.q[7:] - self._default_pose + motor_ang_noise,  # 12 dims: motor angles
                 state_info["last_act"] + last_action_noise,  # 12 dims: last action
             ]
         )
-        # Total: 6 + 3 + 12 + 12 = 33 dims per frame
+        # Total: 6 + 3 + 3 + 12 + 12 = 36 dims per frame
 
         obs = jp.clip(obs, -100.0, 100.0)
 
@@ -427,9 +439,9 @@ def main():
     eval_env = create_env()
     
     print(f"\nEnvironment created:")
-    print(f"  Observation size: {env.observation_size} (33 dims × 20 frames = 660)")
+    print(f"  Observation size: {env.observation_size} (36 dims × 20 frames = 720)")
     print(f"  Action size: {env.action_size}")
-    print(f"  Command slot: PURE NOISE (robot must learn to ignore)")
+    print(f"  Command & orientation slots: PURE NOISE (robot must learn to ignore)")
     print(f"  Robot learns compliance from: IMU, joint angles, action history")
     
     # PPO setup
