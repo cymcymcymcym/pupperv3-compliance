@@ -235,33 +235,43 @@ def train_force_estimator_supervised(
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss
     
-    # Training loop
+    # Training loop - SIMPLE AND FAST (matching train_force_estimator.py approach)
     num_samples = len(obs_norm)
     num_batches = num_samples // batch_size
+    
+    # Pre-transfer ALL data to GPU once (avoid per-batch transfers)
+    obs_gpu = jp.array(obs_norm)
+    force_gpu = jp.array(force_data)
     
     best_loss = float('inf')
     best_params = params
     
+    # Use JAX random key for GPU-native permutations
+    rng = jax.random.PRNGKey(42)
+    
     for epoch in range(num_epochs):
-        # Shuffle
-        perm = np.random.permutation(num_samples)
-        obs_shuffled = obs_norm[perm]
-        force_shuffled = force_data[perm]
+        # Generate permutation ON GPU (like original train_force_estimator.py)
+        rng, perm_rng = jax.random.split(rng)
+        perm = jax.random.permutation(perm_rng, num_samples)
         
         total_loss = 0.0
         for i in range(num_batches):
             start = i * batch_size
             end = start + batch_size
-            obs_batch = jp.array(obs_shuffled[start:end])
-            force_batch = jp.array(force_shuffled[start:end])
+            batch_idx = perm[start:end]  # GPU indexing
+            
+            # GPU→GPU indexing (fast, no transfer)
+            obs_batch = obs_gpu[batch_idx]
+            force_batch = force_gpu[batch_idx]
             
             params, opt_state, loss = train_step(params, opt_state, obs_batch, force_batch)
-            total_loss += float(loss)
+            total_loss += float(loss)  # Small sync per batch, but simple
         
         avg_loss = total_loss / max(1, num_batches)
         
         if avg_loss < best_loss:
             best_loss = avg_loss
+            # Only copy params when we have a new best (not every epoch)
             best_params = jax.tree.map(lambda x: np.array(x), params)
         
         if epoch % 10 == 0 or epoch == num_epochs - 1:
@@ -422,6 +432,7 @@ def collect_data_with_policy(
     """Collect (obs, force) data using trained policy with parallel environments.
     
     Uses vmap to run multiple environments in parallel for much faster collection.
+    OPTIMIZED: Batch transfers, minimize GPU→CPU syncs.
     """
     print(f"  Collecting {num_steps} steps of data with {num_parallel_envs} parallel envs...")
     
@@ -443,10 +454,20 @@ def collect_data_with_policy(
     jit_step = jax.jit(batched_step)
     jit_inference = jax.jit(batched_inference)
     
+    # JIT-compiled function to filter valid samples on GPU
+    @jax.jit
+    def filter_valid_samples(obs, force):
+        """Filter samples with non-zero force on GPU."""
+        force_mags = jp.linalg.norm(force, axis=1)
+        valid_mask = force_mags > 0.1
+        return obs, force, valid_mask, force_mags
+    
     rng = jax.random.PRNGKey(seed)
     
-    obs_list = []
-    force_list = []
+    # Pre-allocate arrays for batch collection (reduce list appends)
+    collection_batch_size = 1000  # Collect this many steps before transferring to CPU
+    obs_buffer_list = []
+    force_buffer_list = []
     
     # Reset all envs
     rng, reset_rng = jax.random.split(rng)
@@ -454,6 +475,8 @@ def collect_data_with_policy(
     
     steps_collected = 0
     total_steps = 0
+    batch_obs_gpu = []
+    batch_force_gpu = []
     
     print(f"    Starting parallel collection...")
     
@@ -467,47 +490,75 @@ def collect_data_with_policy(
         # Step all envs
         state = jit_step(state, actions)
         
-        # Collect from all envs
-        obs_batch = np.array(state.obs)  # [num_envs, obs_dim]
-        force_batch = np.array(state.info.get('force_current_vector', np.zeros((num_parallel_envs, 3))))  # [num_envs, 3]
+        # Get force vector (stay on GPU)
+        force_gpu = state.info.get('force_current_vector', jp.zeros((num_parallel_envs, 3)))
         
-        # Filter non-zero forces
-        force_mags = np.linalg.norm(force_batch, axis=1)
-        valid_mask = force_mags > 0.1
+        # Filter on GPU
+        obs_filtered, force_filtered, valid_mask, force_mags = filter_valid_samples(
+            state.obs, force_gpu
+        )
         
-        if np.any(valid_mask):
-            obs_list.append(obs_batch[valid_mask])
-            force_list.append(force_batch[valid_mask])
-            steps_collected += np.sum(valid_mask)
+        # Accumulate on GPU
+        batch_obs_gpu.append(obs_filtered)
+        batch_force_gpu.append(force_filtered)
         
-        # Reset done envs
-        done = np.array(state.done)
-        if np.any(done):
-            # For simplicity, reset all envs if any are done
-            # (More sophisticated: only reset done ones)
-            rng, reset_rng = jax.random.split(rng)
-            state = jit_reset(reset_rng)
+        # Transfer to CPU in batches (not every step)
+        if len(batch_obs_gpu) >= collection_batch_size // num_parallel_envs:
+            # Concatenate on GPU then transfer
+            all_obs = jp.concatenate(batch_obs_gpu, axis=0)
+            all_force = jp.concatenate(batch_force_gpu, axis=0)
+            all_valid = jp.linalg.norm(all_force, axis=1) > 0.1
+            
+            # Single GPU→CPU transfer
+            obs_cpu = np.array(all_obs[all_valid])
+            force_cpu = np.array(all_force[all_valid])
+            
+            if len(obs_cpu) > 0:
+                obs_buffer_list.append(obs_cpu)
+                force_buffer_list.append(force_cpu)
+                steps_collected += len(obs_cpu)
+            
+            batch_obs_gpu = []
+            batch_force_gpu = []
+        
+        # Reset done envs (check less frequently)
+        if total_steps % (num_parallel_envs * 10) == 0:
+            done = np.array(state.done)
+            if np.any(done):
+                rng, reset_rng = jax.random.split(rng)
+                state = jit_reset(reset_rng)
         
         # Print progress every ~50k steps
         if total_steps % (50000 // num_parallel_envs * num_parallel_envs) < num_parallel_envs:
-            avg_force = np.mean(force_mags)
-            valid_pct = np.mean(valid_mask) * 100
+            avg_force = float(jp.mean(force_mags))
+            valid_pct = float(jp.mean(valid_mask.astype(jp.float32))) * 100
             print(f"    Collected {steps_collected}/{num_steps} samples "
                   f"(total steps: {total_steps}, avg_force: {avg_force:.3f}, valid: {valid_pct:.1f}%)")
         
         # Safety check
         if total_steps > num_steps * 20 and steps_collected < 100:
             print(f"    WARNING: Ran {total_steps} steps but only collected {steps_collected} samples")
-            print(f"    Force magnitudes: min={force_mags.min():.6f}, max={force_mags.max():.6f}")
+            print(f"    Force magnitudes: min={float(jp.min(force_mags)):.6f}, max={float(jp.max(force_mags)):.6f}")
             break
     
-    if len(obs_list) == 0:
+    # Flush remaining GPU buffer
+    if batch_obs_gpu:
+        all_obs = jp.concatenate(batch_obs_gpu, axis=0)
+        all_force = jp.concatenate(batch_force_gpu, axis=0)
+        all_valid = jp.linalg.norm(all_force, axis=1) > 0.1
+        obs_cpu = np.array(all_obs[all_valid])
+        force_cpu = np.array(all_force[all_valid])
+        if len(obs_cpu) > 0:
+            obs_buffer_list.append(obs_cpu)
+            force_buffer_list.append(force_cpu)
+    
+    if len(obs_buffer_list) == 0:
         print("    ERROR: No samples collected! Forces may all be zero.")
         return np.array([]), np.array([])
     
     # Concatenate all collected data
-    all_obs = np.concatenate(obs_list, axis=0)
-    all_forces = np.concatenate(force_list, axis=0)
+    all_obs = np.concatenate(obs_buffer_list, axis=0)
+    all_forces = np.concatenate(force_buffer_list, axis=0)
     
     # Trim to exact number requested
     if len(all_obs) > num_steps:
