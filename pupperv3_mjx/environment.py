@@ -255,7 +255,9 @@ class PupperV3Env(PipelineEnv):
         self._force_point_noise_sd = force_point_noise_sd
 
         # observation configuration
-        self.observation_dim = 36  # 33 without orientation, 36 with orientation
+        # 30 dims: IMU (6) + motor angles (12) + last action (12)
+        # command and desired_orientation removed to avoid circular dependency with force estimator
+        self.observation_dim = 30
         self._observation_history = observation_history
 
         # reward configuration
@@ -695,15 +697,18 @@ class PupperV3Env(PipelineEnv):
         )
 
         # Construct observation and add noise
+        # NOTE: command and desired_orientation removed to avoid circular dependency
+        # when using force estimator output to generate velocity commands
         obs = jp.concatenate(
             [
-                lagged_imu_data,  # noised angular velocity and gravity
-                state_info["command"],  # command
-                state_info["desired_world_z_in_body_frame"],  # desired body orientation
-                pipeline_state.q[7:] - self._default_pose + motor_ang_noise,  # motor angles
-                state_info["last_act"] + last_action_noise,  # last action
+                lagged_imu_data,  # noised angular velocity and gravity (6 dims)
+                # command removed - causes circular dependency with force estimator
+                # desired_world_z_in_body_frame removed - not needed for force estimation
+                pipeline_state.q[7:] - self._default_pose + motor_ang_noise,  # motor angles (12 dims)
+                state_info["last_act"] + last_action_noise,  # last action (12 dims)
             ]
         )
+        # Total: 6 + 12 + 12 = 30 dims per frame
 
         # Clip observation values to prevent extreme values
         obs = jp.clip(obs, -100.0, 100.0)

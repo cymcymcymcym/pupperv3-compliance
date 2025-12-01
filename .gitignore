@@ -6,3 +6,5 @@ pupperv3_mjx/__pycache__/
 render_leash_demo.py
 train_leash.py
 videos/
+final_actor_checkpoint/
+final_force_estimator.json

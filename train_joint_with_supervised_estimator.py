@@ -327,7 +327,7 @@ def get_reward_config():
     config.rewards = config_dict.ConfigDict()
     config.rewards.scales = config_dict.ConfigDict()
     
-    config.rewards.scales.tracking_lin_vel = 1.5
+    config.rewards.scales.tracking_lin_vel = 3.0  # Increased for better velocity tracking
     config.rewards.scales.tracking_ang_vel = 0.0
     config.rewards.scales.tracking_orientation = 1.0
     config.rewards.scales.lin_vel_z = -2.0
@@ -407,7 +407,7 @@ def get_training_config(args, actor_steps: int):
     config.maximum_roll_command = 0.0
     
     config.policy = config_dict.ConfigDict()
-    config.policy.hidden_layer_sizes = (256, 128, 128, 128)  # Must match pretrained checkpoint
+    config.policy.hidden_layer_sizes = (256, 128, 128, 128)  # Policy network architecture
     config.policy.activation = "elu"
     
     return config
@@ -701,7 +701,7 @@ def main():
                 path=args.model_path,
                 reward_config=reward_config,
                 action_scale=0.3,
-                observation_history=20,  # Must match pretrained checkpoint (morning-jazz-49 uses 20)
+                observation_history=20,  # 20 frames × 30 dims = 600 dim observation
                 joint_lower_limits=sim_config.joint_lower_limits,
                 joint_upper_limits=sim_config.joint_upper_limits,
                 torso_name=sim_config.torso_name,
