@@ -218,6 +218,29 @@ class PupperV3EnvPureCompliance(PupperV3Env):
         new_obs_history = jp.roll(obs_history, obs.size).at[: obs.size].set(obs)
 
         return new_obs_history
+    
+    def render(
+        self,
+        trajectory,
+        camera=None,
+        force_vis_scale: float = 0.05,
+    ):
+        """Render trajectory - handles both State objects and pipeline_state objects.
+        
+        This override fixes compatibility with utils.visualize_policy which passes
+        full State objects, while the base PupperV3Env.render expects pipeline_states.
+        """
+        if not trajectory:
+            return []
+        
+        # Check if we got full State objects or pipeline_state objects
+        if hasattr(trajectory[0], 'pipeline_state'):
+            # Got full State objects - extract pipeline_states for base render
+            pipeline_states = [s.pipeline_state for s in trajectory]
+            return super().render(pipeline_states, camera=camera, force_vis_scale=force_vis_scale)
+        else:
+            # Got pipeline_state objects - pass directly to base render
+            return super().render(trajectory, camera=camera, force_vis_scale=force_vis_scale)
 
 
 # ============================================================================
@@ -614,7 +637,7 @@ def main():
         except Exception as e:
             print(f"  Warning: checkpoint saving failed: {e}")
         
-        # Render video
+        # Render video using the proven utils.visualize_policy function
         if args.no_video:
             return
             
@@ -623,44 +646,20 @@ def main():
             video_jit_reset = jax.jit(video_env.reset)
             video_jit_step = jax.jit(video_env.step)
             
-            # Create inference function
-            inference_fn = make_policy(params)
-            jit_inference_fn = jax.jit(inference_fn)
-            
-            # Run rollout with different commands
-            rng = jax.random.PRNGKey(current_step)
-            state = video_jit_reset(rng)
-            
-            # Test with varying force scenarios
-            rollout = [state]
-            n_steps = 400
-            render_every = 2
-            
-            for i in range(n_steps):
-                act_rng, rng = jax.random.split(rng)
-                ctrl, _ = jit_inference_fn(state.obs, act_rng)
-                state = video_jit_step(state, ctrl)
-                rollout.append(state)
-            
-            # Save video
-            video_filename = output_folder / f"step_{current_step}_policy.mp4"
-            fps = int(1.0 / video_env.dt / render_every)
-            media.write_video(
-                str(video_filename),
-                video_env.render([s.pipeline_state for s in rollout[::render_every]], camera="tracking_cam"),
-                fps=fps,
+            utils.visualize_policy(
+                current_step=current_step,
+                make_policy=make_policy,
+                params=params,
+                eval_env=video_env,
+                jit_step=video_jit_step,
+                jit_reset=video_jit_reset,
+                output_folder=str(output_folder),
+                vx=0.5,  # Test forward/back
+                vy=0.3,  # Test sideways
+                wz=1.0,  # Test rotation
             )
-            print(f"  Saved video: {video_filename}")
             
-            # Log video to wandb
-            if use_wandb:
-                try:
-                    wandb.log({
-                        "eval/video": wandb.Video(str(video_filename), format="mp4"),
-                        "eval/video_step": current_step,
-                    }, step=current_step)
-                except Exception as e:
-                    print(f"  Warning: wandb video logging failed: {e}")
+            # Note: utils.visualize_policy handles wandb logging internally
                     
         except Exception as e:
             print(f"  Video rendering failed: {e}")
