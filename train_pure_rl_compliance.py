@@ -54,13 +54,13 @@ class PupperV3EnvPureCompliance(PupperV3Env):
     """
     Pure RL environment for compliance training.
     
-    NO force in observation - robot must learn compliance from physical effects only.
-    Velocity command and orientation slots filled with ZEROS (to match original policy's obs size).
+    NO force/velocity command in observation - robot must learn compliance from physical effects only.
+    Velocity command slot filled with ZEROS, orientation uses actual desired orientation [0,0,1].
     
-    Observation (matches original pupperv3-mjx policy):
+    Observation (matches joint training with estimator):
     - IMU data (angular velocity, gravity) - 6 dims
-    - Velocity command (ZERO) - 3 dims
-    - Desired orientation (ZERO) - 3 dims
+    - Velocity command (ZERO) - 3 dims  <-- No velocity info!
+    - Desired orientation [0,0,1] - 3 dims  <-- Same as joint training
     - Motor angles - 12 dims  
     - Last action - 12 dims
     Total: 36 dims per frame × 20 frames = 720 dims
@@ -85,7 +85,7 @@ class PupperV3EnvPureCompliance(PupperV3Env):
         
         print(f"Pure RL Compliance Environment")
         print(f"  Admittance gains: x={admittance_gains[0]}, y={admittance_gains[1]} m/s per N")
-        print(f"  Observation dim: {self.observation_dim} (command & orientation slots = ZERO)")
+        print(f"  Observation dim: {self.observation_dim} (command=ZERO, orientation=[0,0,1])")
         print(f"  Robot learns compliance purely from physical feedback!")
     
     def reset(self, rng: jax.Array) -> State:
@@ -134,12 +134,12 @@ class PupperV3EnvPureCompliance(PupperV3Env):
         state_info: dict,
         obs_history: jax.Array,
     ) -> jax.Array:
-        """Get observation with ZEROS in command & orientation slots (to match original policy).
+        """Get observation with ZERO command but actual orientation (matches joint training).
         
-        Observation (36 dims per frame, matches original pupperv3-mjx):
+        Observation (36 dims per frame, matches joint training with estimator):
         - IMU data (angular velocity, gravity) - 6 dims
         - Command slot (ZERO) - 3 dims  <-- No velocity command given
-        - Orientation slot (ZERO) - 3 dims  <-- No orientation command given
+        - Desired orientation [0,0,1] - 3 dims  <-- Same as joint training
         - Motor angles - 12 dims
         - Last action - 12 dims
         """
@@ -178,8 +178,9 @@ class PupperV3EnvPureCompliance(PupperV3Env):
         # ZERO for command slot - robot gets no velocity command
         command_zero = jp.zeros(3)
         
-        # ZERO for orientation slot - robot gets no orientation command
-        orientation_zero = jp.zeros(3)
+        # Use actual desired orientation (same as joint training with estimator)
+        # This is typically [0, 0, 1] for "stay level"
+        desired_orientation = state_info.get('desired_world_z_in_body_frame', jp.array([0.0, 0.0, 1.0]))
 
         noised_gravity = math.rotate(jp.array([0, 0, -1]), inv_torso_rot) + gravity_noise
         noised_gravity = noised_gravity / (jp.linalg.norm(noised_gravity) + 1e-6)
@@ -193,12 +194,12 @@ class PupperV3EnvPureCompliance(PupperV3Env):
             self._imu_latency_distribution,
         )
 
-        # Construct observation with ZEROS in command & orientation slots
+        # Construct observation with ZERO command but actual orientation (matches joint training)
         obs = jp.concatenate(
             [
                 lagged_imu_data,  # 6 dims: angular velocity + gravity
                 command_zero,  # 3 dims: ZERO (no velocity command)
-                orientation_zero,  # 3 dims: ZERO (no orientation command)
+                desired_orientation,  # 3 dims: desired orientation [0,0,1] = stay level
                 pipeline_state.q[7:] - self._default_pose + motor_ang_noise,  # 12 dims: motor angles
                 state_info["last_act"] + last_action_noise,  # 12 dims: last action
             ]
@@ -429,7 +430,8 @@ def main():
     print(f"\nEnvironment created:")
     print(f"  Observation size: {env.observation_size} (36 dims × 20 frames = 720)")
     print(f"  Action size: {env.action_size}")
-    print(f"  Command & orientation slots: ZERO (no commands given)")
+    print(f"  Command slot: ZERO (no velocity command)")
+    print(f"  Orientation slot: [0,0,1] (stay level, same as joint training)")
     print(f"  Robot learns compliance from: IMU, joint angles, action history")
     
     # PPO setup
