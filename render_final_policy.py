@@ -18,7 +18,7 @@ import json
 import os
 import functools
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -35,16 +35,39 @@ from brax.io import mjcf
 from brax.training.agents.ppo import networks as ppo_networks
 
 from pupperv3_mjx import config, environment, utils
+from pupperv3_mjx.environment_with_estimator import PupperV3EnvWithEstimator
 
 
-def load_force_estimator(estimator_path: Path):
-    """Load force estimator from JSON file."""
+# ============================================================================
+# Force Estimator Observation Processing
+# ============================================================================
+
+ESTIMATOR_FRAMES = 10  # Force estimator uses last 10 frames
+
+
+def load_force_estimator(estimator_path: Path, estimator_frames: int = ESTIMATOR_FRAMES):
+    """Load force estimator from JSON file.
+    
+    Args:
+        estimator_path: Path to force_estimator.json
+        estimator_frames: Number of frames the estimator expects (default 10)
+    
+    Returns:
+        Tuple of (estimator_fn, expected_input_dim)
+    """
     with open(estimator_path) as f:
         est_dict = json.load(f)
 
     layers = est_dict["layers"]
     input_mean = jp.array(est_dict["input_mean"])
     input_std = jp.array(est_dict["input_std"])
+    
+    # Infer expected input dimension from first layer
+    first_dense = next(l for l in layers if l.get("type", "dense") == "dense")
+    expected_input_dim = len(first_dense["weights"][0])
+    
+    print(f"  Force estimator expects {expected_input_dim} input dims")
+    print(f"  Input mean shape: {input_mean.shape}, std shape: {input_std.shape}")
 
     parsed_layers = []
     for layer in layers:
@@ -71,7 +94,11 @@ def load_force_estimator(estimator_path: Path):
             return x
 
     def estimator_fn(obs: jp.ndarray) -> jp.ndarray:
-        x = (obs - input_mean) / (input_std + 1e-6)
+        """Apply force estimator to preprocessed observation."""
+        # Handle zero std
+        input_std_safe = jp.where(input_std < 1e-6, 1.0, input_std)
+        x = (obs - input_mean) / input_std_safe
+        
         for layer_info in parsed_layers:
             layer_type = layer_info[0]
             if layer_type == "dense":
@@ -87,7 +114,72 @@ def load_force_estimator(estimator_path: Path):
                 x = apply_activation(x, activation)
         return x
 
-    return estimator_fn
+    return estimator_fn, expected_input_dim
+
+
+def prepare_estimator_input(
+    obs: jp.ndarray, 
+    env_frame_dim: int = 30,
+    estimator_frame_dim: int = 36,
+    observation_history: int = 20,
+    estimator_frames: int = ESTIMATOR_FRAMES,
+) -> jp.ndarray:
+    """Convert environment observation to force estimator input format.
+    
+    The base environment (PupperV3Env) has 30-dim frames:
+        - IMU data: 6 dims (indices 0-5)
+        - Motor angles: 12 dims (indices 6-17)
+        - Last action: 12 dims (indices 18-29)
+    
+    The force estimator was trained on 36-dim frames:
+        - IMU data: 6 dims (indices 0-5)
+        - Command: 3 dims (indices 6-8) - MASKED TO ZERO
+        - Orientation: 3 dims (indices 9-11) - MASKED TO ZERO
+        - Motor angles: 12 dims (indices 12-23)
+        - Last action: 12 dims (indices 24-35)
+    
+    Args:
+        obs: Raw observation from environment [env_frame_dim * observation_history]
+        env_frame_dim: Dimension per frame from environment (30 for base env)
+        estimator_frame_dim: Dimension per frame expected by estimator (36)
+        observation_history: Total frames in observation (20)
+        estimator_frames: Number of frames to use for estimator (10)
+    
+    Returns:
+        Processed observation for force estimator [estimator_frame_dim * estimator_frames]
+    """
+    # Reshape to frames
+    total_obs_dim = env_frame_dim * observation_history
+    if obs.shape[-1] != total_obs_dim:
+        # Maybe already 36-dim frames?
+        if obs.shape[-1] == estimator_frame_dim * observation_history:
+            # Already in 36-dim format, just extract and mask
+            frames = obs.reshape(observation_history, estimator_frame_dim)
+            recent_frames = frames[-estimator_frames:]
+            # Mask command/orientation (indices 6:12)
+            masked_frames = recent_frames.at[:, 6:12].set(0.0)
+            return masked_frames.reshape(-1)
+        else:
+            raise ValueError(f"Unexpected obs shape: {obs.shape}, expected {total_obs_dim} or {estimator_frame_dim * observation_history}")
+    
+    frames = obs.reshape(observation_history, env_frame_dim)
+    
+    # Take only the most recent frames
+    recent_frames = frames[-estimator_frames:]
+    
+    # Convert 30-dim to 36-dim format by inserting 6 zeros for command/orientation
+    # 30-dim: [IMU(6), motors(12), action(12)]
+    # 36-dim: [IMU(6), cmd(3), orient(3), motors(12), action(12)]
+    def expand_frame(frame_30):
+        imu = frame_30[:6]
+        motors = frame_30[6:18]
+        action = frame_30[18:30]
+        cmd_orient = jp.zeros(6)  # Masked command + orientation
+        return jp.concatenate([imu, cmd_orient, motors, action])
+    
+    expanded_frames = jax.vmap(expand_frame)(recent_frames)
+    
+    return expanded_frames.reshape(-1)
 
 
 def draw_force_arrow(
@@ -160,18 +252,60 @@ def main():
         default=42,
         help="Random seed"
     )
+    parser.add_argument(
+        "--use-noise",
+        action="store_true",
+        help="Replace estimator output with random noise (ablation test)"
+    )
+    parser.add_argument(
+        "--use-zero",
+        action="store_true",
+        help="Replace estimator output with zeros (ablation test)"
+    )
+    parser.add_argument(
+        "--force-magnitude-range",
+        type=str,
+        default="2,6",
+        help="Force magnitude range (min,max) in Newtons for noise generation"
+    )
+    parser.add_argument(
+        "--noise-seed",
+        type=int,
+        default=None,
+        help="Random seed for noise generation (default: uses --seed)"
+    )
     
     args = parser.parse_args()
     
     admittance_gains = tuple(float(x) for x in args.admittance_gains.split(","))
+    force_magnitude_range = tuple(float(x) for x in args.force_magnitude_range.split(","))
     
     print(f"Loading force estimator from: {args.force_estimator_path}")
     print(f"Loading actor from: {args.actor_checkpoint_path}")
     print(f"Admittance gains: {admittance_gains}")
     
+    if args.use_noise and args.use_zero:
+        print("ERROR: Cannot use both --use-noise and --use-zero. Pick one.")
+        return
+    
+    if args.use_noise:
+        # Noise magnitude = force_magnitude * 0.2, so range is [min*0.2, max*0.2]
+        noise_force_min = force_magnitude_range[0] * 0.2
+        noise_force_max = force_magnitude_range[1] * 0.2
+        print(f"⚠️  ABLATION MODE: Using random NOISE instead of estimator!")
+        print(f"   Noise force magnitude range: [{noise_force_min:.2f}, {noise_force_max:.2f}] N")
+    
+    if args.use_zero:
+        print(f"⚠️  ABLATION MODE: Using ZERO force instead of estimator!")
+    
     # Load force estimator
-    estimator_fn = load_force_estimator(Path(args.force_estimator_path))
+    estimator_fn, expected_input_dim = load_force_estimator(Path(args.force_estimator_path))
     jit_estimator = jax.jit(estimator_fn)
+    
+    # Determine estimator frame count from input dimension
+    # 36 dims per frame, so input_dim / 36 = num_frames
+    estimator_frames = expected_input_dim // 36
+    print(f"  Force estimator uses {estimator_frames} frames ({expected_input_dim} dims)")
     
     # Setup environment config
     reward_config = config.get_config()
@@ -185,7 +319,8 @@ def main():
     kp = 30.0
     kd = 1.0
     
-    env = environment.PupperV3Env(
+    # Use PupperV3EnvWithEstimator to get 36-dim frames (720-dim obs) matching actor training
+    env = PupperV3EnvWithEstimator(
         path=args.model_path,
         reward_config=reward_config,
         action_scale=action_scale,
@@ -195,7 +330,11 @@ def main():
         force_probability=0.8,
         force_duration_range=jp.array([40, 120]),
         force_magnitude_range=jp.array([2, 6]),  # Must match training!
+        force_estimator_path=args.force_estimator_path,
+        admittance_gains=admittance_gains,
     )
+    
+    print(f"  Environment observation size: {env.observation_size} (expecting 720)")
     
     # Load actor from Orbax checkpoint
     print("Loading actor checkpoint...")
@@ -209,9 +348,17 @@ def main():
     print(f"  Normalizer keys: {list(normalizer_params.keys())}")
     print(f"  Network keys: {list(network_params.keys())}")
     
-    # Create policy network
+    # Create policy network - use obs size from normalizer (actor checkpoint) 
+    # to ensure compatibility
+    obs_size_from_normalizer = normalizer_params['mean'].shape[0]
     obs_size = env.observation_size
     action_size = env.action_size
+    
+    print(f"  Env obs size: {obs_size}, Actor normalizer obs size: {obs_size_from_normalizer}")
+    
+    if obs_size != obs_size_from_normalizer:
+        print(f"  WARNING: Obs size mismatch! Using normalizer size {obs_size_from_normalizer}")
+        obs_size = obs_size_from_normalizer
     
     # Network architecture (must match training)
     policy_hidden_sizes = (256, 128, 128, 128)
@@ -258,7 +405,7 @@ def main():
     jit_step = jax.jit(env.step)
     
     # Run simulation
-    rng = jax.random.PRNGKey(args.seed)
+    rng = jax.random.PRNGKey(34)
     rng, reset_rng = jax.random.split(rng)
     state = jit_reset(reset_rng)
     
@@ -273,11 +420,45 @@ def main():
     
     print(f"Running {args.num_steps} steps...")
     
+    # JIT the observation preprocessing
+    jit_prepare_input = jax.jit(
+        lambda obs: prepare_estimator_input(
+            obs, 
+            env_frame_dim=env.observation_dim,
+            estimator_frame_dim=36,
+            observation_history=observation_history,
+            estimator_frames=estimator_frames
+        )
+    )
+    
+    # Setup noise generator if using noise ablation
+    noise_seed = args.noise_seed if args.noise_seed is not None else args.seed
+    noise_rng = np.random.default_rng(noise_seed)
+    if args.use_noise:
+        print(f"   Noise seed: {noise_seed}")
+    
     for step in range(args.num_steps):
         rng, act_rng = jax.random.split(rng)
         
-        # Get force estimate
-        raw_prediction = np.asarray(jit_estimator(state.obs))
+        if args.use_zero:
+            # ABLATION: Replace estimator with zeros
+            raw_prediction = np.zeros(3)
+        elif args.use_noise:
+            # ABLATION: Replace estimator with random noise
+            # Generate random direction (unit vector)
+            noise_direction = noise_rng.standard_normal(3)
+            noise_direction = noise_direction / (np.linalg.norm(noise_direction) + 1e-6)
+            # Generate random magnitude in range [force_min*0.2, force_max*0.2]
+            noise_force_min = force_magnitude_range[0] * 0.2
+            noise_force_max = force_magnitude_range[1] * 0.2
+            noise_magnitude = noise_rng.uniform(noise_force_min, noise_force_max)
+            raw_prediction = noise_direction * noise_magnitude
+        else:
+            # Normal mode: Use force estimator
+            # Prepare observation for force estimator (extract last N frames, mask, reshape)
+            estimator_input = jit_prepare_input(state.obs)
+            raw_prediction = np.asarray(jit_estimator(estimator_input))
+        
         smoothed_prediction = prediction_smoothing * raw_prediction + (1 - prediction_smoothing) * smoothed_prediction
         
         # Compute velocity command from admittance
@@ -305,9 +486,19 @@ def main():
     estimated_forces = np.asarray(estimated_forces)
     velocity_commands = np.asarray(velocity_commands)
     
-    print("\nForce estimation stats:")
+    if args.use_zero:
+        mode_label = "ZERO (ablation)"
+        est_label = "Zero"
+    elif args.use_noise:
+        mode_label = "NOISE (ablation)"
+        est_label = "Noise"
+    else:
+        mode_label = "Estimator"
+        est_label = "Estimated"
+    
+    print(f"\nForce stats ({mode_label}):")
     print(f"  Actual force mag: mean={np.linalg.norm(actual_forces, axis=1).mean():.2f}, max={np.linalg.norm(actual_forces, axis=1).max():.2f}")
-    print(f"  Estimated force mag: mean={np.linalg.norm(estimated_forces, axis=1).mean():.2f}, max={np.linalg.norm(estimated_forces, axis=1).max():.2f}")
+    print(f"  {est_label} force mag: mean={np.linalg.norm(estimated_forces, axis=1).mean():.2f}, max={np.linalg.norm(estimated_forces, axis=1).max():.2f}")
     
     # Compute direction error (cosine similarity)
     actual_norms = np.linalg.norm(actual_forces, axis=1, keepdims=True) + 1e-6
@@ -405,7 +596,13 @@ def main():
             ax.grid(True, alpha=0.3)
         
         axes[-1].set_xlabel('Time (s)')
-        axes[0].set_title('Force Estimation: Ground Truth vs Predicted')
+        if args.use_zero:
+            title = 'ABLATION: Ground Truth vs Zero Input'
+        elif args.use_noise:
+            title = 'ABLATION: Ground Truth vs Random Noise'
+        else:
+            title = 'Force Estimation: Ground Truth vs Predicted'
+        axes[0].set_title(title)
         
         plt.tight_layout()
         plt.savefig(str(plot_path), dpi=150)
