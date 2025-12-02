@@ -20,9 +20,10 @@ Usage:
 import argparse
 import functools
 import os
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 # Set EGL for headless rendering BEFORE importing mujoco
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -31,12 +32,17 @@ import jax
 from jax import numpy as jp
 import numpy as np
 from ml_collections import config_dict
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for headless servers
+import matplotlib.pyplot as plt
 
 from brax import envs
 from brax.training.agents.ppo import train as ppo
 from brax.training.agents.ppo import networks as ppo_networks
 from brax.io import mjcf
 from orbax import checkpoint as ocp
+from flax.training import orbax_utils
+import mediapy as media
 
 try:
     import wandb
@@ -288,7 +294,7 @@ def get_training_config(args):
     config.ppo.num_minibatches = 32
     config.ppo.num_updates_per_batch = 4
     config.ppo.discounting = 0.97
-    config.ppo.learning_rate = 3.0e-4
+    config.ppo.learning_rate = 3.0e-5  # Match joint training
     config.ppo.entropy_cost = 1e-2
     config.ppo.num_envs = args.num_envs
     config.ppo.batch_size = 256
@@ -326,6 +332,8 @@ def main():
     parser.add_argument("--num-envs", type=int, default=4096,
                         help="Number of parallel environments")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--learning-rate", type=float, default=3.0e-5,
+                        help="Learning rate for PPO (default matches joint training)")
     
     # Compliance
     parser.add_argument("--admittance-gains", type=str, default="0.1,0.1",
@@ -348,6 +356,7 @@ def main():
     parser.add_argument("--no-wandb", action="store_true", help="Disable WandB")
     parser.add_argument("--wandb-project", type=str, default="pupperv3-pure-rl-compliance",
                         help="WandB project name")
+    parser.add_argument("--wandb-entity", type=str, default=None, help="WandB entity (team/user)")
     parser.add_argument("--no-video", action="store_true", help="Disable video rendering")
     
     args = parser.parse_args()
@@ -370,32 +379,77 @@ def main():
     print(f"Output: {output_folder}")
     print("=" * 70)
     
-    # Initialize WandB
+    # Load configs first (needed for wandb config)
+    reward_config = get_reward_config()
+    sim_config = get_simulation_config(args.model_path)
+    training_config = get_training_config(args)
+    
+    # Override learning rate if provided
+    training_config.ppo.learning_rate = args.learning_rate
+    
+    # Build comprehensive wandb config
+    full_config = {
+        # Compliance-specific
+        "compliance": {
+            "admittance_gains": admittance_gains,
+            "force_magnitude_range": [args.force_magnitude_min, args.force_magnitude_max],
+            "force_probability": args.force_probability,
+        },
+        # PPO params
+        "ppo": training_config.ppo.to_dict(),
+        # Reward scales
+        "reward_scales": reward_config.rewards.scales.to_dict(),
+        "tracking_sigma": reward_config.rewards.tracking_sigma,
+        # Policy architecture
+        "policy": {
+            "hidden_layer_sizes": training_config.policy.hidden_layer_sizes,
+            "activation": training_config.policy.activation,
+            "action_scale": 0.3,
+            "observation_history": 20,
+        },
+        # Domain randomization
+        "domain_randomization": {
+            "friction_range": [0.6, 1.4],
+            "body_mass_scale_range": [0.8, 1.2],
+            "kp_multiplier_range": [0.85, 1.15],
+            "kd_multiplier_range": [0.85, 1.15],
+        },
+        # Training
+        "seed": args.seed,
+        "restore_checkpoint": args.restore_checkpoint,
+        # Simulation
+        "simulation": {
+            "model_path": args.model_path,
+            "physics_dt": sim_config.physics_dt,
+            "environment_dt": training_config.environment_dt,
+        },
+    }
+    
+    # Initialize WandB with comprehensive config
     use_wandb = WANDB_AVAILABLE and not args.no_wandb
     if use_wandb:
         if args.wandb_key:
             wandb.login(key=args.wandb_key)
         try:
             wandb.init(
+                entity=args.wandb_entity,
                 project=args.wandb_project,
-                config={
-                    "admittance_gains": admittance_gains,
-                    "force_magnitude_range": [args.force_magnitude_min, args.force_magnitude_max],
-                    "num_timesteps": args.num_timesteps,
-                    "num_envs": args.num_envs,
-                }
+                config=full_config,
+                save_code=True,
+                settings=wandb.Settings(
+                    _service_wait=90,
+                    init_timeout=90,
+                )
             )
-            print("WandB initialized")
+            print(f"WandB initialized: {wandb.run.name}")
+            # Update output folder to include wandb run name
+            output_folder = Path(f"output_{wandb.run.name}").resolve()
+            output_folder.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             print(f"WandB init failed: {e}")
             use_wandb = False
     else:
         print("Training without WandB logging")
-    
-    # Load configs
-    reward_config = get_reward_config()
-    sim_config = get_simulation_config(args.model_path)
-    training_config = get_training_config(args)
     
     # Create environment factory
     def create_env(**kwargs):
@@ -403,7 +457,7 @@ def main():
             path=args.model_path,
             reward_config=reward_config,
             action_scale=0.3,
-            observation_history=20,  # 20 frames × 33 dims = 660 dim observation
+            observation_history=20,  # 20 frames × 36 dims = 720 dim observation
             joint_lower_limits=sim_config.joint_lower_limits,
             joint_upper_limits=sim_config.joint_upper_limits,
             torso_name=sim_config.torso_name,
@@ -455,46 +509,159 @@ def main():
         seed=args.seed,
     )
     
-    # Progress function
-    def progress_fn(num_steps, metrics):
+    # =========================================================================
+    # Progress tracking (like Nathan's notebook)
+    # =========================================================================
+    x_data: List[int] = []
+    y_data: List[float] = []
+    ydataerr: List[float] = []
+    times: List[datetime] = [datetime.now()]
+    
+    def progress_fn(num_steps: int, metrics: dict):
+        """
+        Comprehensive progress logging with plots and wandb integration.
+        Logs ALL metrics from Brax PPO, not just reward.
+        """
+        times.append(datetime.now())
+        
         if 'eval/episode_reward' in metrics:
             reward = metrics['eval/episode_reward']
             reward_std = metrics.get('eval/episode_reward_std', 0)
-            print(f"  Step {num_steps:,} | Reward: {reward:.2f} ± {reward_std:.2f}")
             
-            if use_wandb:
-                try:
+            x_data.append(num_steps)
+            y_data.append(reward)
+            ydataerr.append(reward_std)
+            
+            # Calculate training speed
+            if len(times) >= 2:
+                elapsed = (times[-1] - times[-2]).total_seconds()
+                if elapsed > 0 and len(x_data) >= 2:
+                    steps_since_last = x_data[-1] - x_data[-2] if len(x_data) >= 2 else num_steps
+                    steps_per_sec = steps_since_last / elapsed
+                else:
+                    steps_per_sec = 0
+            else:
+                steps_per_sec = 0
+            
+            # Print progress
+            print(f"  Step {num_steps:,} | Reward: {reward:.2f} ± {reward_std:.2f} | Speed: {steps_per_sec:,.0f} steps/s")
+            
+            # Save progress plot
+            try:
+                plt.figure(figsize=(10, 6))
+                plt.xlim([0, args.num_timesteps * 1.25])
+                plt.ylim([0, 50])  # Adjust based on expected reward range
+                plt.xlabel("# environment steps")
+                plt.ylabel("reward per episode")
+                plt.title(f"Pure RL Compliance Training - Latest: {reward:.2f}")
+                plt.errorbar(x_data, y_data, yerr=ydataerr, capsize=3, marker='o', markersize=4)
+                plt.grid(True, alpha=0.3)
+                plot_path = output_folder / "training_progress.png"
+                plt.savefig(plot_path, dpi=100, bbox_inches='tight')
+                plt.close()
+            except Exception as e:
+                print(f"  Warning: Could not save progress plot: {e}")
+        
+        # Log ALL metrics to wandb (like Nathan's notebook)
+        if use_wandb:
+            try:
+                # Log the full metrics dict (includes all PPO internals)
+                wandb.log(metrics, step=num_steps)
+                
+                # Also log computed values
+                if 'eval/episode_reward' in metrics:
                     wandb.log({
-                        "reward": reward,
-                        "reward_std": reward_std,
-                        "steps": num_steps,
+                        "training/steps_per_second": steps_per_sec,
+                        "training/total_time_minutes": (times[-1] - times[0]).total_seconds() / 60,
                     }, step=num_steps)
-                except:
-                    pass
+            except Exception as e:
+                print(f"  Warning: wandb logging failed: {e}")
     
-    # Track full params for checkpoint saving
+    # =========================================================================
+    # Track params and save checkpoints
+    # =========================================================================
     latest_full_params = [None]
     
-    # Video rendering callback
-    def policy_params_fn(current_step, make_policy, params):
+    def policy_params_fn(current_step: int, make_policy, params):
+        """
+        Callback for saving checkpoints and rendering videos.
+        Logs checkpoints and videos to wandb.
+        """
         latest_full_params[0] = params
         
+        # Save checkpoint
+        checkpoint_step_path = output_folder / str(current_step)
+        try:
+            orbax_checkpointer = ocp.PyTreeCheckpointer()
+            save_args = orbax_utils.save_args_from_target(params)
+            orbax_checkpointer.save(
+                str(checkpoint_step_path.resolve()),
+                params,
+                force=True,
+                save_args=save_args
+            )
+            print(f"  Saved checkpoint: {checkpoint_step_path}")
+            
+            # Log checkpoint to wandb
+            if use_wandb:
+                try:
+                    wandb.log_model(
+                        path=str(checkpoint_step_path),
+                        name=f"checkpoint_{wandb.run.name}_{current_step}"
+                    )
+                except Exception as e:
+                    print(f"  Warning: wandb checkpoint logging failed: {e}")
+        except Exception as e:
+            print(f"  Warning: checkpoint saving failed: {e}")
+        
+        # Render video
         if args.no_video:
             return
+            
         try:
             video_env = create_env()
             video_jit_reset = jax.jit(video_env.reset)
             video_jit_step = jax.jit(video_env.step)
             
-            utils.visualize_policy(
-                current_step=current_step,
-                make_policy=make_policy,
-                params=params,
-                eval_env=video_env,
-                jit_step=video_jit_step,
-                jit_reset=video_jit_reset,
-                output_folder=str(output_folder)
+            # Create inference function
+            inference_fn = make_policy(params)
+            jit_inference_fn = jax.jit(inference_fn)
+            
+            # Run rollout with different commands
+            rng = jax.random.PRNGKey(current_step)
+            state = video_jit_reset(rng)
+            
+            # Test with varying force scenarios
+            rollout = [state]
+            n_steps = 400
+            render_every = 2
+            
+            for i in range(n_steps):
+                act_rng, rng = jax.random.split(rng)
+                ctrl, _ = jit_inference_fn(state.obs, act_rng)
+                state = video_jit_step(state, ctrl)
+                rollout.append(state)
+            
+            # Save video
+            video_filename = output_folder / f"step_{current_step}_policy.mp4"
+            fps = int(1.0 / video_env.dt / render_every)
+            media.write_video(
+                str(video_filename),
+                video_env.render([s.pipeline_state for s in rollout[::render_every]], camera="tracking_cam"),
+                fps=fps,
             )
+            print(f"  Saved video: {video_filename}")
+            
+            # Log video to wandb
+            if use_wandb:
+                try:
+                    wandb.log({
+                        "eval/video": wandb.Video(str(video_filename), format="mp4"),
+                        "eval/video_step": current_step,
+                    }, step=current_step)
+                except Exception as e:
+                    print(f"  Warning: wandb video logging failed: {e}")
+                    
         except Exception as e:
             print(f"  Video rendering failed: {e}")
     
@@ -510,9 +677,15 @@ def main():
         else:
             print(f"Warning: Checkpoint not found: {checkpoint_path}")
     
-    # Train!
+    # =========================================================================
+    # Train with timing!
+    # =========================================================================
     print("\nStarting training...")
-    make_inference_fn, params, metrics = train_fn(
+    print("  (First step includes JIT compilation time)")
+    
+    training_start_time = datetime.now()
+    
+    make_inference_fn, params, final_metrics = train_fn(
         environment=env,
         progress_fn=progress_fn,
         eval_env=eval_env,
@@ -520,19 +693,96 @@ def main():
         **checkpoint_kwargs
     )
     
+    training_end_time = datetime.now()
+    
+    # Calculate timing metrics
+    total_training_time = (training_end_time - training_start_time).total_seconds()
+    time_to_jit = (times[1] - times[0]).total_seconds() if len(times) > 1 else 0
+    time_to_train = (times[-1] - times[1]).total_seconds() if len(times) > 1 else total_training_time
+    
+    print(f"\n  Time to JIT: {time_to_jit:.1f}s")
+    print(f"  Time to train: {time_to_train:.1f}s ({time_to_train/60:.1f} min)")
+    print(f"  Total time: {total_training_time:.1f}s ({total_training_time/60:.1f} min)")
+    
+    if args.num_timesteps > 0 and time_to_train > 0:
+        avg_steps_per_sec = args.num_timesteps / time_to_train
+        print(f"  Average speed: {avg_steps_per_sec:,.0f} steps/s")
+    
+    # Log timing to wandb
+    if use_wandb:
+        try:
+            wandb.run.summary["time_to_jit"] = time_to_jit
+            wandb.run.summary["time_to_train"] = time_to_train
+            wandb.run.summary["total_training_time"] = total_training_time
+            if len(y_data) > 0:
+                wandb.run.summary["final_reward"] = y_data[-1]
+                wandb.run.summary["best_reward"] = max(y_data)
+        except Exception as e:
+            print(f"  Warning: wandb summary logging failed: {e}")
+    
+    # =========================================================================
     # Save final checkpoint
-    checkpoint_path = (output_folder / "final_checkpoint").resolve()
+    # =========================================================================
+    final_checkpoint_path = (output_folder / "final_checkpoint").resolve()
     if latest_full_params[0] is not None:
-        orbax_checkpointer = ocp.PyTreeCheckpointer()
-        orbax_checkpointer.save(
-            str(checkpoint_path),
-            latest_full_params[0],
-            force=True
-        )
-        print(f"\nSaved checkpoint to: {checkpoint_path}")
+        try:
+            orbax_checkpointer = ocp.PyTreeCheckpointer()
+            save_args = orbax_utils.save_args_from_target(latest_full_params[0])
+            orbax_checkpointer.save(
+                str(final_checkpoint_path),
+                latest_full_params[0],
+                force=True,
+                save_args=save_args
+            )
+            print(f"\nSaved final checkpoint to: {final_checkpoint_path}")
+            
+            # Log final checkpoint to wandb
+            if use_wandb:
+                try:
+                    wandb.log_model(
+                        path=str(final_checkpoint_path),
+                        name=f"final_checkpoint_{wandb.run.name}"
+                    )
+                except:
+                    pass
+        except Exception as e:
+            print(f"  Warning: Final checkpoint saving failed: {e}")
+    
+    # Save final progress plot
+    try:
+        plt.figure(figsize=(12, 7))
+        plt.subplot(1, 1, 1)
+        plt.fill_between(x_data, 
+                         [y - e for y, e in zip(y_data, ydataerr)],
+                         [y + e for y, e in zip(y_data, ydataerr)],
+                         alpha=0.3, color='blue')
+        plt.plot(x_data, y_data, 'b-', linewidth=2, marker='o', markersize=5)
+        plt.xlabel("Environment Steps", fontsize=12)
+        plt.ylabel("Episode Reward", fontsize=12)
+        plt.title(f"Pure RL Compliance Training - Final: {y_data[-1]:.2f}" if y_data else "Training Progress", fontsize=14)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        final_plot_path = output_folder / "final_training_progress.png"
+        plt.savefig(final_plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved final progress plot to: {final_plot_path}")
+        
+        # Log final plot to wandb
+        if use_wandb:
+            try:
+                wandb.log({"training/final_progress_plot": wandb.Image(str(final_plot_path))})
+            except:
+                pass
+    except Exception as e:
+        print(f"  Warning: Could not save final plot: {e}")
     
     print("\n" + "=" * 70)
     print("Training complete!")
+    print("=" * 70)
+    if y_data:
+        print(f"  Final reward: {y_data[-1]:.2f}")
+        print(f"  Best reward: {max(y_data):.2f}")
+    print(f"  Output folder: {output_folder}")
     print("=" * 70)
     
     if use_wandb:
