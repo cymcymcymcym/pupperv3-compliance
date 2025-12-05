@@ -125,13 +125,15 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         # Layout per frame: IMU(6) | velocity command(3) | desired orientation(3) | motors(12) | last action(12)
         self.observation_dim = 36
         
-        self._estimator_history = 10
+        # Auto-detect estimator frame count from loaded model's input dimension
+        estimator_input_dim = self._force_estimator['input_mean'].shape[0]
+        self._estimator_history = estimator_input_dim // self.observation_dim
 
         print(f"Loaded force estimator from {force_estimator_path}")
         print(f"Admittance gains: x={admittance_gains[0]}, y={admittance_gains[1]} m/s per N")
         print(f"Actor observation: 36 dims (estimator command + orientation + proprioception)")
         print(f"Force estimator history: {self._estimator_history} frames "
-              f"({self._estimator_history * self.observation_dim} dims)")
+              f"({self._estimator_history * self.observation_dim} dims) [auto-detected]")
         print(f"Reward uses GROUND TRUTH force (not estimated)")
     
     def _estimate_force(self, obs: jax.Array) -> jax.Array:
@@ -313,7 +315,8 @@ class PupperV3EnvWithEstimator(PupperV3Env):
         estimated_command = state_info.get('estimated_command', jp.zeros(3))
 
         # Desired orientation command (same as base environment)
-        desired_orientation = state_info.get('desired_world_z_in_body_frame', jp.zeros(3))
+        # Default to [0,0,1] = "stay level" to match pure RL training
+        desired_orientation = state_info.get('desired_world_z_in_body_frame', jp.array([0.0, 0.0, 1.0]))
 
         # Construct observation WITH command from estimator
         obs = jp.concatenate(

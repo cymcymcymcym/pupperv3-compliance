@@ -253,7 +253,7 @@ def get_reward_config():
     config.rewards.scales = config_dict.ConfigDict()
     
     # High weight on velocity tracking - this is the main objective!
-    config.rewards.scales.tracking_lin_vel = 3.0
+    config.rewards.scales.tracking_lin_vel = 5
     config.rewards.scales.tracking_ang_vel = 0.0  # No yaw tracking
     
     # Standard locomotion rewards
@@ -261,14 +261,15 @@ def get_reward_config():
     config.rewards.scales.lin_vel_z = -2.0
     config.rewards.scales.ang_vel_xy = -0.05
     config.rewards.scales.orientation = -5.0
-    config.rewards.scales.torques = -0.0002
-    config.rewards.scales.joint_acceleration = -1e-6
+    config.rewards.scales.torques = -0.01
+    config.rewards.scales.joint_acceleration = -1e-3
     config.rewards.scales.mechanical_work = 0.0
-    config.rewards.scales.action_rate = -0.01
+    config.rewards.scales.action_rate = -0.1
     config.rewards.scales.feet_air_time = 0.05
     config.rewards.scales.stand_still = -0.5
     config.rewards.scales.stand_still_joint_velocity = -0.1
     config.rewards.scales.abduction_angle = -0.1
+    config.rewards.scales.zero_force_motion = -5.0  # Heavy penalty when moving with no applied force
     config.rewards.scales.termination = -100.0
     config.rewards.scales.foot_slip = -0.1
     config.rewards.scales.knee_collision = -1.0
@@ -359,7 +360,7 @@ def main():
                         help="Learning rate for PPO (default matches joint training)")
     
     # Compliance
-    parser.add_argument("--admittance-gains", type=str, default="0.1,0.1",
+    parser.add_argument("--admittance-gains", type=str, default="0.2,0.2",
                         help="Admittance gains (x,y) in m/s per N")
     
     # Force parameters
@@ -369,6 +370,10 @@ def main():
                         help="Maximum force magnitude (N)")
     parser.add_argument("--force-probability", type=float, default=0.8,
                         help="Probability of force being active")
+    parser.add_argument("--force-duration-min", type=int, default=40,
+                        help="Minimum force duration in environment steps")
+    parser.add_argument("--force-duration-max", type=int, default=120,
+                        help="Maximum force duration in environment steps")
     
     # Checkpoint
     parser.add_argument("--restore-checkpoint", type=str, default=None,
@@ -397,6 +402,7 @@ def main():
     print("=" * 70)
     print(f"Admittance gains: x={admittance_gains[0]}, y={admittance_gains[1]} m/s per N")
     print(f"Force range: {args.force_magnitude_min} - {args.force_magnitude_max} N")
+    print(f"Force duration: {args.force_duration_min} - {args.force_duration_max} steps")
     print(f"Num timesteps: {args.num_timesteps:,}")
     print(f"Num envs: {args.num_envs}")
     print(f"Output: {output_folder}")
@@ -417,6 +423,7 @@ def main():
             "admittance_gains": admittance_gains,
             "force_magnitude_range": [args.force_magnitude_min, args.force_magnitude_max],
             "force_probability": args.force_probability,
+            "force_duration_range": [args.force_duration_min, args.force_duration_max],
         },
         # PPO params
         "ppo": training_config.ppo.to_dict(),
@@ -497,6 +504,7 @@ def main():
             foot_radius=sim_config.foot_radius,
             force_probability=args.force_probability,
             force_magnitude_range=jp.array([args.force_magnitude_min, args.force_magnitude_max]),
+            force_duration_range=jp.array([args.force_duration_min, args.force_duration_max]),
             admittance_gains=admittance_gains,
             **kwargs
         )

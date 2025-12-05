@@ -453,29 +453,42 @@ class PupperV3Env(PipelineEnv):
         # Check if force duration has expired
         force_expired = state.info['force_remaining_duration'] <= 0
         
-        # If expired and should activate, start new force; otherwise decrement or stay at 0
+        # If expired, decide next phase (active vs inactive)
         state.info["force_active"] = jp.where(force_expired, should_activate, state.info["force_active"])
         state.info["force_remaining_duration"] = jp.where(
             force_expired,
-            jp.where(should_activate, duration, 0),  # If activating, set duration; else 0
+            duration,  # Use sampled duration for both active and inactive phases
             state.info["force_remaining_duration"] - 1  # Otherwise decrement
         )
-        state.info["force_target_vector"] = jp.where(
+        # Update force target: new force if activating, zero if not active
+        new_force_target = jp.where(
             force_expired & should_activate,
             direction * magnitude,
-            state.info["force_target_vector"]  # Keep existing target if not starting new
+            state.info["force_target_vector"]
         )
+        # When force is not active, zero out the target immediately
+        state.info["force_target_vector"] = jp.where(
+            state.info["force_active"],
+            new_force_target,
+            jp.zeros(3)  # Zero when not active
+        )
+        
         state.info["force_application_point_noisy"] = jp.where(
             force_expired & should_activate,
             noisy_point,
             state.info["force_application_point_noisy"]
         )
 
-        # Smooth interpolation between current and target force
+        # Smooth interpolation only when force is active, otherwise zero immediately
         alpha = 0.5  # Smoothing factor (lower = smoother transitions)
-        state.info["force_current_vector"] = (
+        smoothed_force = (
             alpha * state.info["force_target_vector"] + 
             (1 - alpha) * state.info["force_current_vector"]
+        )
+        state.info["force_current_vector"] = jp.where(
+            state.info["force_active"],
+            smoothed_force,
+            jp.zeros(3)  # Zero immediately when not active
         )
         
         # Apply force at the stored application point
@@ -600,6 +613,13 @@ class PupperV3Env(PipelineEnv):
                 tracking_sigma=self._reward_config.rewards.tracking_sigma,
             ),
         }
+        if "zero_force_motion" in self._reward_config.rewards.scales:
+            rewards_dict["zero_force_motion"] = rewards.reward_zero_force_motion(
+                state.info["force_current_vector"],
+                xd,
+                lin_deadband=self._stand_still_command_threshold,
+                force_threshold=0.25,
+            )
         rewards_dict = {
             k: v * self._reward_config.rewards.scales[k] for k, v in rewards_dict.items()
         }

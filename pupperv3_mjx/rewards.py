@@ -120,6 +120,40 @@ def reward_stand_still(
     )
 
 
+def reward_zero_force_motion(
+    force: jax.Array,
+    xd: Motion,
+    lin_deadband: float = 0.03,
+    ang_deadband: float = 0.05,
+    force_threshold: float = 0.1,
+) -> jax.Array:
+    """
+    Penalize base motion when no external force is applied.
+
+    Args:
+        force: External wrench force vector applied to the torso (world frame).
+        xd: Brax motion object containing base linear and angular velocities.
+        lin_deadband: Allowable planar velocity magnitude before penalty (m/s).
+        ang_deadband: Allowable yaw rate before penalty (rad/s).
+        force_threshold: Force magnitude below which we treat the robot as unloaded.
+    """
+    force_mag = jp.linalg.norm(force)
+
+    base_linear_vel = xd.vel[0]
+    planar_speed = jp.sqrt(jp.sum(jp.square(base_linear_vel[:2])) + EPS)
+    linear_excess = jp.maximum(planar_speed - lin_deadband, 0.0)
+    linear_penalty = jp.square(linear_excess)
+
+    base_yaw_rate = jp.abs(xd.ang[0, 2])
+    yaw_excess = jp.maximum(base_yaw_rate - ang_deadband, 0.0)
+    yaw_penalty = jp.square(yaw_excess)
+
+    penalty = linear_penalty + yaw_penalty
+    penalty = jp.where(force_mag < force_threshold, penalty, 0.0)
+
+    return jp.clip(penalty, -1000.0, 1000.0)
+
+
 def reward_foot_slip(
     pipeline_state: base.State,
     contact_filt: jax.Array,
