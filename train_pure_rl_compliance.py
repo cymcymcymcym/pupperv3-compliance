@@ -25,8 +25,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Tuple, List
 
-# Set EGL for headless rendering BEFORE importing mujoco
-os.environ.setdefault("MUJOCO_GL", "egl")
+# Set rendering backend for headless rendering BEFORE importing mujoco
+# Use OSMesa for headless rendering (more reliable than EGL on many systems)
+# Can be overridden by setting MUJOCO_GL environment variable
+os.environ.setdefault("MUJOCO_GL", "osmesa")
 
 import jax
 from jax import numpy as jp
@@ -651,6 +653,7 @@ def main():
             return
             
         try:
+            # Try with current MUJOCO_GL setting
             video_env = create_env()
             video_jit_reset = jax.jit(video_env.reset)
             video_jit_step = jax.jit(video_env.step)
@@ -671,7 +674,35 @@ def main():
             # Note: utils.visualize_policy handles wandb logging internally
                     
         except Exception as e:
-            print(f"  Video rendering failed: {e}")
+            # If EGL failed, try falling back to OSMesa
+            if "EGL" in str(e) or "egl" in str(e).lower():
+                print(f"  EGL rendering failed, trying OSMesa fallback...")
+                try:
+                    original_gl = os.environ.get("MUJOCO_GL", "egl")
+                    os.environ["MUJOCO_GL"] = "osmesa"
+                    video_env = create_env()
+                    video_jit_reset = jax.jit(video_env.reset)
+                    video_jit_step = jax.jit(video_env.step)
+                    
+                    utils.visualize_policy(
+                        current_step=current_step,
+                        make_policy=make_policy,
+                        params=params,
+                        eval_env=video_env,
+                        jit_step=video_jit_step,
+                        jit_reset=video_jit_reset,
+                        output_folder=str(output_folder),
+                        vx=0.5,
+                        vy=0.3,
+                        wz=1.0,
+                    )
+                    # Keep osmesa for future renders
+                    print(f"  Successfully using OSMesa for rendering")
+                except Exception as e2:
+                    print(f"  Video rendering failed with both EGL and OSMesa: {e2}")
+                    os.environ["MUJOCO_GL"] = original_gl  # Restore original
+            else:
+                print(f"  Video rendering failed: {e}")
     
     # Checkpoint loading
     checkpoint_kwargs = {}
