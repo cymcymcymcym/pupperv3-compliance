@@ -76,6 +76,18 @@ def reward_tracking_ang_vel(
     return jp.clip(jp.exp(-ang_vel_error / (tracking_sigma + EPS)), -1000.0, 1000.0)
 
 
+def reward_tracking_forward_vel(
+    commands: jax.Array, x: Transform, xd: Motion, tracking_sigma
+) -> jax.Array:
+    # Tracking of forward velocity in body frame (x-axis only)
+    # Compares body-frame forward speed against commands[0]
+    local_vel = math.rotate(xd.vel[0], math.quat_inv(x.rot[0]))
+    forward_vel = local_vel[0]  # x-component is forward in body frame
+    forward_vel_error = jp.square(commands[0] - forward_vel)
+    forward_vel_reward = jp.exp(-forward_vel_error / (tracking_sigma + EPS))
+    return jp.clip(forward_vel_reward, -1000.0, 1000.0)
+
+
 def reward_feet_air_time(
     air_time: jax.Array,
     first_contact: jax.Array,

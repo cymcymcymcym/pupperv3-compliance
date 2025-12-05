@@ -253,8 +253,9 @@ def get_reward_config():
     config.rewards.scales = config_dict.ConfigDict()
     
     # High weight on velocity tracking - this is the main objective!
-    config.rewards.scales.tracking_lin_vel = 5
+    config.rewards.scales.tracking_lin_vel = 0
     config.rewards.scales.tracking_ang_vel = 0.0  # No yaw tracking
+    config.rewards.scales.tracking_forward_vel = 5  # Forward-only velocity tracking (disabled by default)
     
     # Standard locomotion rewards
     config.rewards.scales.tracking_orientation = 1.0
@@ -269,7 +270,7 @@ def get_reward_config():
     config.rewards.scales.stand_still = -0.5
     config.rewards.scales.stand_still_joint_velocity = -0.1
     config.rewards.scales.abduction_angle = -0.1
-    config.rewards.scales.zero_force_motion = -5.0  # Heavy penalty when moving with no applied force
+    config.rewards.scales.zero_force_motion = -3.0  # Heavy penalty when moving with no applied force
     config.rewards.scales.termination = -100.0
     config.rewards.scales.foot_slip = -0.1
     config.rewards.scales.knee_collision = -1.0

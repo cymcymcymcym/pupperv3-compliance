@@ -620,6 +620,13 @@ class PupperV3Env(PipelineEnv):
                 lin_deadband=self._stand_still_command_threshold,
                 force_threshold=0.25,
             )
+        if "tracking_forward_vel" in self._reward_config.rewards.scales:
+            rewards_dict["tracking_forward_vel"] = rewards.reward_tracking_forward_vel(
+                state.info["command"],
+                x,
+                xd,
+                tracking_sigma=self._reward_config.rewards.tracking_sigma,
+            )
         rewards_dict = {
             k: v * self._reward_config.rewards.scales[k] for k, v in rewards_dict.items()
         }
